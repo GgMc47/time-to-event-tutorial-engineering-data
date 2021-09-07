@@ -6,6 +6,8 @@ MSc dissertation, Gregor McAlpine, September 2021
 
 This dissertation project is intended as a tutorial for mechanical engineers on conducting time-t-event regression analysis with material strength data in R. The "tensile_data.csv" file contains the data used in this tutorial which is simply a typed up version of the experimental data tables from (Naresh, Shankar, Velmurugan, 2018). 
 
+The full .Rmd file contains the full code for the tutorial, this has been uploaded in order to allow for recreating plots and other outputs.
+
 The R script files contain wrapper functions used in the tutorial and are free to access.
 
 "qextr.R" is a simple function to obtain probabilities from an extreme value distribution in the same way that one would using `qnorm` or `qlogis` in R.
