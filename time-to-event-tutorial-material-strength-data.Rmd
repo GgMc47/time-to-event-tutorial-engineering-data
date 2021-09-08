@@ -1,0 +1,906 @@
+---
+title: "A tutorial on using time-to-event regression to analyse material strength data in mechanical engineering"
+author: "Gregor McAlpine"
+date: ''
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,fig.width = 7, fig.height = 4,fig.align = "center")
+```
+```{r,echo=FALSE,include=FALSE}
+suppressPackageStartupMessages(library(tidyverse))
+suppressPackageStartupMessages(library(readr))
+suppressPackageStartupMessages(library(broom))
+suppressPackageStartupMessages(library(kableExtra))
+suppressPackageStartupMessages(library(survival))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(ggpubr))
+suppressPackageStartupMessages(library(gridExtra))
+suppressPackageStartupMessages(library(survminer))
+```
+```{r,message=FALSE,echo=FALSE}
+tensile <- read_csv("tensile_data.csv")
+```
+```{r, echo=FALSE}
+qextr<-function(p){
+  log(-log(1-p))
+}
+
+gofplot<-function(fit, dist){ #fit is a survfit object, dist is one of the location-scale distributions to be checked
+  if(dist=="lognormal"){
+    plot(log(fit$time),qnorm(1-fit$surv),ylab="Inverse normal of survival",xlab="log(t)",main=dist)
+    lines(log(fit$time),qnorm(1-fit$surv))
+  } else if(dist=="loglogistic"){
+    plot(log(fit$time),qlogis(1-fit$surv),ylab="Inverse logistic of survival",xlab="log(t)",main=dist)
+    lines(log(fit$time),qlogis(1-fit$surv))
+  } else if(dist=="weibull"){
+    plot(log(fit$time),qextr(1-fit$surv),ylab="Inverse weibull of survival",xlab="log(t)",main=dist) 
+    lines(log(fit$time),qextr(1-fit$surv))
+  }
+}
+
+gatherAFTpred<-function(fitAFT,data,x){#x list of expl vars
+  val_list=list()
+  for(var in x){
+    var_i<-eval(parse(text=paste0(deparse(substitute(data)),sep="$",var)))
+    vals = unique(var_i) 
+    val_list <- append(val_list, list(vals)) #store
+  }
+  val_df<-expand.grid(val_list)
+  colnames(val_df)<-x
+  for(var in colnames(val_df)){ # factor variables turn into level, want to keep as character for labels
+    var_i<-paste0(deparse(substitute(data)),sep="$",var)
+    if(is.factor(eval(parse(text=var_i)))){ #if main data is factor
+      val_df[var] = as.character(unlist(val_df[var])) # make character
+    }
+  }
+  pct=seq(.99,.01,by=-.01)
+  df = data.frame(y=pct)
+  for(i in 1:nrow(val_df)){
+    combination = paste0("Pred::",paste(val_df[i,],collapse=","))
+    df[, ncol(df)+1] <- list(predict(fitAFT, newdata=val_df[i,], type='quantile', p=1-pct)) # Append new column
+    colnames(df)[ncol(df)] <- combination
+  }
+  df_long = gather(df, key="combination", value="x", -y)
+  return(df_long)
+}
+gatherCoxpred<-function(fitCox,data,x,quantity="time",event="status",N=100){#x list of expl vars
+  val_list=list()
+  for(var in x){
+    var_i<-eval(parse(text=paste0(deparse(substitute(data)),sep="$",var)))
+    vals = unique(var_i) 
+    val_list <- append(val_list, list(vals)) #store
+  }
+  val_df<-expand.grid(val_list)
+  colnames(val_df)<-x
+  for(var in colnames(val_df)){ # factor variables turn into level, want to keep as character for labels
+    var_i<-paste0(deparse(substitute(data)),sep="$",var)
+    if(is.factor(eval(parse(text=var_i)))){ #if main data is factor
+      val_df[var] = as.character(unlist(val_df[var])) # make character
+    }
+  }
+  val_df=val_df[rep(seq_len(nrow(val_df)), each = N),] # need replicates for predicting cox
+  val_df[event]=rep(1,nrow(val_df)) # events occurred
+  mini=min(eval(parse(text=paste0(deparse(substitute(data)),sep="$",quantity)))) # -10% below minimum observed
+  maxi=max(eval(parse(text=paste0(deparse(substitute(data)),sep="$",quantity)))) # +10% over maximum observed
+  quantity_reps=seq(mini-0.1*mini, maxi+0.1*maxi, length.out=N) # sequence of quanity
+  val_df[quantity]=rep(quantity_reps,length.out=nrow(val_df)) # replicate
+  df = data.frame(x=quantity_reps) # quantity as x-values
+  for(i in 1:(nrow(val_df)/N)){
+    combination = paste0("Pred::",paste(val_df[i*N-(N-1),-which(names(val_df) %in% c(event,quantity))],collapse=","))
+    low=i*N-(N-1)
+    high=i*N
+    pred_vals=val_df %>% slice(low:high)
+    df[, ncol(df)+1] <- list(predict(fitCox,newdata=pred_vals,type="survival")) # Append new column
+    colnames(df)[ncol(df)] <- combination
+  }
+  df_long = gather(df, key="combination", value="y", -1)
+  return(df_long)
+}
+```
+\pagebreak 
+
+# Introduction
+
+The focus of this project is to provide a tutorial for mechanical engineers on how time-to-event analysis techniques can be applied to strength and reliability testing in engineering. Time-to-event analysis is most common in bio-statistics, where it is usually called survival analysis, examining survival times and the factors which affect them. Time-to-event data most often includes time as the outcome variable measuring the time until an event of interest occurs but in reality any positive quantity can be used and the analysis techniques are not limited to contexts involving time.   
+This tutorial is based on the idea of using the positive values of tensile strength in place of time and applying time-to-event analysis methods to material strength data with the event of interest being the failure or breakage of the material. The aim of this tutorial is to showcase how to apply analysis methods to data in a practical context using a real strength testing data set and to provide the user with an understanding of the mathematics behind key time-to-event analysis methods and models. The data that was used to create this tutorial comes from the paper "Reliability analysis of tensile strengths using Weibull distribution in glass/epoxy and carbon/epoxy composites" (Naresh, Shankar and Velmurugan, 2018) and the data comes from experiments conducted to find the tensile strengths of composites using a drop mass testing machine with a maximum capacity of 30 kiloNewtons.   
+In order to conduct and demonstrate the techniques in this tutorial we will be using R and it is expected that the user will already be familiar with the fundamentals of the R programming language. R is a free open-source package, available at r-project.org, which is designed specifically for statistics, there is a vast array of packages and libraries available in R including several designed for time-to-event analysis which we will be using in this tutorial. If a user is not already familiar with R, there are many links on the R website which can be used to learn and a recommended overview of the basics of R can be found in the appendix of (Moore, 2016), this overview should provide the user with enough understanding of the basics of R to be able to use this tutorial. Everything in this tutorial is designed to be replicable with other data sets as long as they fall under the general positive quantity measured to an event of interest framework. All code and functions mentioned in this tutorial are available for access on github, see the first section of the appendix for more details.
+
+\pagebreak
+
+# Chapter 1: Time-to-event data
+
+## Data and Formatting
+
+It is important that we familiarize ourselves with data sets before any analysis can take place so we will first briefly go through the experiment details and examine the variables with which we are going to work. The height and strain rate were calibrated and the machine recorded the amount of force being applied on the glass fiber reinforced polymer (GFRP) and carbon fiber reinforced polymer (CFRP) composites. The height and strain rate measurements come in pairs as these were controls, what they were really trying to investigate were the strength differences at different strain rates between the 3 different stacking sequences used in the composites and the 2 reinforcement materials used. The stacking sequence was the main variable of interest, each composite laminate is made of 4 layers, each of 0.4mm thickness, and each layer had different fiber orientations, the angles of these were measured after zero degrees was determined.  In the study, the researchers were interested in finding the optimal combination of fiber orientations to find the stacking sequence of glass/epoxy and carbon/epoxy composites which had the largest tensile strength or largest increase in tensile strength as the strain increased.  
+In order to conduct the data analysis that we will be doing in this tutorial it is important that data is in "long-form" format, also known as "tidy data" (Grolemund, n.d.), this means that each row should correspond to one experiment with explanatory and outcome variable values stated. Table 1 demonstrates the variables used and the necessary format for this type of analysis.  
+```{r,echo=FALSE,message = FALSE}
+set.seed(1)
+tensile[sample(nrow(tensile), 5), ] %>% arrange(height) %>%
+  kable(caption = "Tensile strength data",digits=3)  %>%
+    kable_styling(full_width = F,latex_options="hold_position")
+```
+The status variable is new and does not come from the original data set, this is an indicator variable which takes a value of 1 if the composite failed and 0 otherwise, this variable is essential for the survival objects that we are going to use in this tutorial as it facilitates the inclusion of censored data into the analysis. In general this type of variable should take a value of 1 if the event of interest for an experiment occurred and 0 if censoring had to occur for any reason. 
+The "long form" format also allows for the simpler investigation of individual effects, for example the first and last row in Table 1 differ only by the height/strain rate pair which allows for more direct comparison of the individual effect of increasing the strain rate while holding other variables constant. It is important to only include one of height and strain rate in any models since these variables were used as controls and they come in pairs, there is no way of distinguishing the individual effects of both of these since they do not vary independently. Therefore, for the rest of this tutorial we are only going to talk about strain rate and ignore the height variable.
+
+## Key statistical concepts
+
+### Survival probability
+
+The survival function $$S(t)=P(T>t)=1-P(T \leq t)=1-F(t)\tag{1.1}$$ is the probability of survival of an individual subject up to quantity $t$ which has cumulative distribution function $F(t)$. In the data being used for this tutorial the positive random variable $T$ is strength but $T$ can be any positive random variable depending on the study being conducted such as time or length. $S(t)$ takes the value 1 at time 0 and decreases as $t$ increases, never falling below 0. For uncensored data this can be estimated easily with a ratio of the number of subjects who have survived until point $t$ divided by the total number of subjects at the beginning of the experiment. For example in a study of 100 materials if 60 materials failed before reaching a strength of 200MPa then $P(T>200)=1-\frac{60}{100}=0.4.$ However, when censoring is present using the same method will result in an incorrect estimation of survival.  
+Survival probability is not the only measure used in time-to-event contexts, the instantaneous rate of experiencing an event of interest, called the hazard, is also often used and in reliability testing this would be considered the instantaneous failure rate. The hazard is formally defined as $$h(t)=lim_{\Delta t\rightarrow0}\frac{P(t\leq T<t+\Delta t|T\geq t)}{\Delta t},\tag{1.2}$$ the probability that an event occurs near positive quantity t given that a subject has survived until t. This is related to the survival function by the equation $$S(t)=exp[-\int_{0}^{t} h(u) \,du]. \tag{1.3}$$
+
+### Censoring
+
+```{r, echo=FALSE}
+#random censoring
+set.seed(122) 
+strengthc <- tensile$strength
+n <- 126
+cens<-100 + rexp(n,rate=0.0009)
+y<-pmin(strengthc,cens)
+status1<-1*(strengthc<cens)
+Surv_cens_rand <- Surv(y,status1) # new surv object
+
+# type 1 censoring
+s_max<-400
+y2<-pmin(strengthc,s_max)
+status2<-1*(strengthc<s_max)
+Surv_cens_max<-Surv(y2,status2) # new surv object
+#new censored datasets
+rc_tensile <- tensile %>% 
+  mutate(strength = y, status= status1)
+mc_tensile <- tensile %>% 
+  mutate(strength = y2, status=status2)
+```
+Censoring is an extremely common characteristic of time-to-event data which arises when events of interest are not precisely observed but there is partial information available. The most common form of this is right censoring which occurs when the endpoint event is not observed but it is known to exceed a particular value. There are many reasons which could result in the necessity for censoring but in this tutorial we will focus on two specific types.  
+The first type of censoring we will consider is random (non-informative) censoring, where each experimental run has a chance to be censored due to events occurring which are beyond control such as human or machine errors. It is also assumed that these errors are unrelated to the variable T being measured. In a strength testing experiment this could occur due to a malfunction in the machine which forces the experimental run to be aborted before the event of interest is observed and by censoring the result it allows the partial information gained to still be useful in analysis.  
+Another circumstance in which censoring can arise is the situation where the endpoint event cannot be observed as it has a higher value than the experiment's maximum capacity. This is usually known as Type I censoring as there is pre-specified endpoint of an experiment and any subjects which have not yet experienced the event are censored at that point. For example in an experiment where time is involved in strength testing there may be a point at which it is no longer feasible to wait for an event to occur, or there may be a material which is strong enough that the maximum force a machine can exert is not enough to cause breakage. In both situations the positive quantities being measured would be censored at the maximum value that the experiment allows.  
+It is common to use an auxiliary (status) variable in time-to-event data that is essential for the R functions we will use. It is defined as an indicator variable for interpretation of raw data as a strength value of say 250MPa without any additional information would not give us enough information. With the status variable next to it we can learn if an event occurred at this value (status=1) or if the subject had to be censored at this value (status=0) and an event had not yet occured at 250MPa but it was not possible to observe further. Censoring works by keeping the value at which a subject was censored, noting that it was censored at this value and then removing the subject from the set of all subjects which are still at risk of experiencing the event of interest, called the at risk set. The reason why it is so important to account for censoring is because not doing so can cause survival probabilities to be estimated incorrectly.  
+We shall use simulated random censoring objects to demonstrate this. The plot in Figure 1 demonstrates the importance of removing censored observations from the set of at risk subjects. The data used to create this plot is the artificially censored tensile data set which was created to help illustrate the handling of censored data. 
+```{r echo = FALSE, message = FALSE, warning = FALSE, fig.height = 6, fig.cap="Effect of not censoring observations"}
+exampledata <- rc_tensile %>% 
+  mutate(strength = ifelse(status == 1, strength, 501), 
+         group = "No censoring") %>% 
+  full_join(mutate(rc_tensile, group = "With censoring"))
+fit_nocens <- survfit(Surv(strength, status) ~ group, data = exampledata)
+ggsurvplot(
+  data = exampledata, 
+  fit = fit_nocens,
+  xlab = "Strength",
+  legend = "bottom",
+  legend.title = "",
+  legend.labs = c("No censoring", "With censoring"),
+  risk.table = TRUE,
+  risk.table.y.text = FALSE)
+```
+The blue line in Figure 1 shows the survival curve of the data with random censoring and the red line represents the survival curve if censored observations were not removed from the at risk set. The risk table below the plot shows the evolution of the at risk set. Both groups start with the same number of laminates and have the same number of failures but without censoring the overall survival probability is overestimated due to the 23 censored composite laminates never being removed from the at risk set. Despite the likelihood that they would have experienced an event before 500MPa, no event was observed so without censoring those laminates would have to remain in the set of at risk subjects. 
+The plot in Figure 2 demonstrates the resulting survival curves if the censored observations were instead excluded or ignored.
+```{r echo = FALSE, message = FALSE, warning = FALSE, fig.height = 6,fig.cap="Effect of excluding censored observations"}
+exampledata2 <- rc_tensile %>% 
+  subset(status==1) %>% 
+  mutate(group="Ignoring censoring") %>%
+  full_join(mutate(rc_tensile, group = "With censoring"))
+fit_igncens <- survfit(Surv(strength, status) ~ group, data = exampledata2)
+ggsurvplot(
+  data = exampledata2, 
+  fit = fit_igncens,
+  xlab = "Strength",
+  legend = "bottom",
+  legend.title = "",
+  legend.labs = c("Ignoring censoring", "With censoring"),
+  risk.table = "abs_pct",
+  risk.table.y.text = FALSE)
+```
+The random censoring example in theory represents a dataset where random errors in machinery occurred, this graph clearly demonstrates that excluding observations where censoring would be necessary results in a lowered, less accurate survival curve due to the loss of the partial information gained from the censored observations. From the risk table below the graph we can see that the estimated probability of a laminate from this dataset reaching 200MPa tensile strength, if censored observations are excluded, is 0.55. But with censoring the method of calculating survival probabilities is different and the survival probability is not 0.58 but actually 0.62 as we will show in the next section.  
+
+## Survival objects
+
+Most of the analysis techniques showcased in this tutorial make use of the `survival` R package which is available from the main CRAN (Comprehensive R Archive Network) repository. Within this package we have the `Surv` function which usually takes 2 arguments, a time or any positive quantity such as strength like we have in the tensile data set that this tutorial focuses on, and a status indicator as mentioned in the previous sections. This function creates a survival object most commonly used as a response variable in a model formula. For ease I am going to create a survival object now for use in formulas and functions.  
+```{r}
+surv_object <- with(tensile,Surv(strength,status))
+```
+Another useful function is the `survfit` function which estimates the survival function from a formula or model, the first kind of survival curve we are going to look at is the Kaplan-Meier curve. The Kaplan-Meier estimator $$\hat{S}(t)=\prod_{t_i \leq t}(1-\frac{d_i}{n_i}) \tag{1.4}$$ takes into account censored observations and removes them from the set of at risk subjects $n_i$, it calculates the survival function estimate as the product for all $t_i\leq t$ of 1 minus the number of events which occurred $d_i$ at the points $t_i$ divided by the number of members of the at risk set at those points. When censoring is not present in the data this equates to a simple ratio of the number of subjects which survived until point $t$ divided by the number of subjects at the beginning.  
+This was seen in the previous example where we excluded censored observations; when there is no censoring the survival probability is just the percentage of subjects still at risk which at 200MPa tensile strength was 55%, however when censoring is present the Kaplan-Meier estimator is used and the survival probability differs. In our example with censoring 58% of subjects were still at risk at 200MPa but if we extract the survival probabilities from the survfit object used: (Note that "times" is the assumed positive quantity for `survfit` objects)
+```{r}
+summary(fit_igncens, times = 200) # percentage at risk not equal to survival
+```
+we find that the survival probability of the group with censoring is 0.62, not 0.58.  
+We create Kaplan-Meier estimators for use in plotting survival curves using the `survfit` function with a survival object as the response variable in a formula with explanatory variables on the right hand side. We can plot the overall survival curve of all the composites in our dataset by using the following base R plotting commands.
+```{r,fig.cap="Base R survival plot"}
+plot(survfit(surv_object ~ 1, data = tensile), 
+     xlab = "Tensile strength", 
+     ylab = "Overall survival probability")
+```
+In the plot in Figure 3 the survival curve follows a staircase pattern because the Kaplan-Meier estimate remains constant in between observed events. The dotted lines above and below the curve represent the upper and lower confidence bands, these demonstrate that the estimator would expect the survival probability at any value to be somewhere within these two bands with 95% confidence.  
+We can also use the `survminer` package which adds survival curve plotting to R's `ggplot2` package functionality, this would be recommended as `ggplot` is a very useful tool for plotting as it allows for much simpler and straightforward graph customization and results in cleaner, better looking plots. It is also good practice to use wrapper libraries like `ggplot` which save time and make repeating processes easier. `ggsurvplot` is what was used to create the plots in the previous censoring examples, risk tables can be added by specifying with the `risk.table` argument, these showcase the number of subjects at risk at specific values of the survival variable. This time we are going to include `material` as an explanatory variable in the formula to be plotted.
+```{r,message=FALSE,fig.cap="ggsurvplot example"}
+ggsurvplot(
+    fit = survfit(surv_object ~ material, data = tensile), 
+    xlab = "Tensile strength", 
+    ylab = "Overall survival probability")
+```
+From the graph in Figure 4 we can interpret that despite both materials having almost identical survival probabilities to start with, overall CFRP composites have a significantly larger probability of reaching larger strength values. Presenting data using these plots are very useful as a visual representation of the differences between groups.   
+
+## Qualitative variables
+
+Qualitative data consists of categorical or qualitative variables which take one of a limited number of possible values, assigning units to distinct groups or categories by some property such as colour or material. It is very rare for time-to-event data to not include at least one categorical variable in a data set. With categorical or grouped data we are interested in observing and quantifying the differences between distinct groups, for example in our data set we have material and stacking sequence which are both categorical variables and we are interested in finding the differences in survival within these categories. We can easily separate Kaplan-Meier curves by a grouped variable by including that variable in the model formula which we pass into the first argument of `survfit`.
+```{r,fig.cap="Kaplan-Meier curves split by stacking sequence"}
+KMstack <- survfit(surv_object ~ stacking, data = tensile)
+ggsurvplot(KMstack, conf.int = TRUE) +
+  xlab('Strength')
+```
+This Kaplan-Meier curve in Figure 5 demonstrates clear differences between stacking sequences. The blue curve demonstrates that the "30/-60/60/-30" stacking sequence is significantly weaker or more likely to fail earlier than the other two sequences as we can observe the survival probability decreases much faster than the other curves. The red curve belonging to the "0/90/30/-60" stacking sequence indicates that this sequence is the strongest of the three as the survival probability decreases the slowest. The curves plotted are good illustrations of the patterns that we would expect to see but we will be looking to quantify and model the exact differences between groups in this tutorial. The Kaplan-Meier estimates of each curve are done independently of each other so no information is shared between groups, in later modelling sections this will not be the case as we will be pooling the data together when we come to fit the data with parametric distributions.  
+
+## Quantitative variables
+
+Quantitative data consists of continuous or discrete quantitative variables which can take one of an uncountable set of values, data is usually obtained through measuring or counting. With quantitative data we cannot separate the data so easily into distinct groups, sometimes this is done through discretising the variables by creating intervals and treating different intervals as groups but most often we are attempting to quantify the effect of increasing the value of a quantitative variable by 1. So in analysis we would be investigating the effect on the response variable of, for example, a unit increase in the mass of an object. In the tensile data set both height and strain rate are quantitative. However, the vectors of variables are proportional to each other so these variables do not vary individually at any point while keeping the other constant, this makes it impossible to investigate the individual effects of both of these variables at the same time. To account for this, throughout the rest of this tutorial, we will focus only on the effect of strain rate. Survival curves for quantitative data can still be drawn but `survfit` will attempt to treat each unique value that a variable takes as its own group as we can observe in Figure 6, for this data set we can still include all curves on the same plot but this may become more difficult to read in data sets where a continuous variable takes many unique values and it may be necessary to discretize the variable to a limited number of intervals.
+```{r, echo=FALSE, fig.cap="Kaplan-Meier curves by strain rate"}
+KMstrain <- survfit(surv_object ~ strain_rate, data = tensile)
+ggsurvplot(KMstrain, conf.int = FALSE) +
+  xlab('Strength')
+```
+The plot in Figure 6 tells us that as the strain rate increases the survival probabilities also increase.  
+Before any analysis occurs it is usually best to use the `mutate` function from the `tidyverse` collection of packages to ensure that all variables are classified correctly. Reading in data frames can often result in variables being considered as character variables when we want to ensure that they are factor or numeric variables.
+```{r}
+tensile <- tensile %>% mutate(strain_rate = as.numeric(strain_rate),
+                              material = as.factor(material),
+                              stacking = as.factor(stacking))
+```
+\pagebreak
+
+.
+
+\pagebreak
+
+# Chapter 2: Parametric Models
+
+The survival curves presented in the previous chapter have two key characteristics; they are not smooth and they have arbitrary behaviour apart from being decreasing. The Kaplan-Meier curves are empirical, they do not make any assumptions of probability distributions nor do they assume any relationship between the different curves. In this chapter we will introduce parametric models which assume underlying probability distributions for the strengths of composites, parametric models also produce smoothed survival curves and their decreasing behaviour will be limited by the estimated parameters so their behaviour will not be arbitrary.
+
+## Accelerated Failure Time Models
+
+The first method we are going to look at to compare between groups in parametric models is called the accelerated failure time (AFT) model. Generally, in this model, there are underlying parameters estimated for each group defined by the explanatory variables, these are called location parameters, and an additional parameter is estimated which is equal across all of the data called the scale.  
+The following framework is used for AFT models: let $T$ be the time to event for unit i, tensile strength until breakage in the tensile data, and we assume that $\log(T)$ has a probability distribution that belongs to the class of location and scale distributions. These distributions have only two parameters to be estimated, the location (which we will denote by $\mu$) and scale (which we will denote by $\sigma$). In this case, it is possible to write:
+
+$$\log(T)=\mu+\sigma\,Z \tag{2.1}$$
+where $Z$ is a standardized random variable with a completely specified probability distribution in the real line. The main three cases considered are the following
+
+* $Z$ has a standard normal distribution
+
+* $Z$ has a logistic distribution
+
+* $Z$ has a smallest extreme value distribution
+
+Then we have that the survival function of 
+$$T=\exp(\mu+\sigma\,Z) \tag{2.2}$$ is given by
+$$S_T(t)=P(T>t)=P(\exp(\mu+\sigma\,Z)>t)=P\left(Z>\frac{\log(t)-\mu}{\sigma}\right)=S_Z\left(\frac{\log(t)-\mu}{\sigma}\right) \tag{2.3}$$
+Now since the distribution of Z is completely specified we have a general expression for the survival function of any distribution that comes from the location scale family described above. The corresponding distributions of $T$ for the three cases above are
+
+* The log-normal
+
+* The log-logistic
+
+* The log-extreme value which is better know as the Weibull distribution
+
+We can fit these models to data by using the `survreg` function from the `survival` package, this function is very similar to `survfit` but is specific to accelerated failure time models. The next thing we need to know is what are the parameterisations that `survreg` uses internally and link these with $\mu$ and $\sigma$. `survreg` fits the accelerated failure time models where the location parameter $\mu$ always corresponds to the model formula. That is, if the model formula is `Surv(strength, status) ~ material + strain_rate` then it is using $$\mu=\boldsymbol{x}'\boldsymbol{\beta}=\beta_0+\beta_1 \mbox{GFRP material}+\beta_2 \mbox{strain rate} \tag{2.4}$$ and the scale parameter is always called `scale` independently of the distribution specified. Note that in equation (2.4) there is only a coefficient for GFRP materials as this coefficient will represent the change in $\mu$ for GFRP composites compared to CFRP composites as the CFRP level is taken as a reference level.  
+From equation (2.4) we can clearly see that a change in the explanatory variables will cause a change in $\mu$ which, from equation (2.1), will in turn cause a change in T. In general we interpret these models in terms of the median survival as it can be easily calculated as the value of $t$ such that $P(T>t)=0.5$ with half of the observations above and half of the observations below, this is convenient for us since $\mu$ is the median of the distribution of $log(T)$ and therefore $\exp(\mu)$ is the median of T.  
+If we wanted to know the survival strength $T_i$ of the i-th observation then from equation (1.1) we have $$log(T_i)=\mu+\sigma Z_i=\boldsymbol{x}'_i\boldsymbol{\beta}+\sigma Z_i, \tag{2.5}$$ exponentiating this we get another version of equation (2.2) $$T_i=\exp(\boldsymbol{x}'_i\boldsymbol{\beta})T_{0i}, \tag{2.6}$$ where $T_{0i}$ is used for the exponential of $\sigma Z_i$. Then we can consider $\gamma_i=\exp(\boldsymbol{x}'_i\boldsymbol{\beta})$ to be the coefficient of acceleration towards failure for composite i, hence the name accelerated failure time model.  
+To illustrate this we shall use the model with material as the only explanatory variable `surv_object~material`. For material the reference group is CFRP composites, the survival function can be denoted $S_0(t)$, and to find the survival function for GFRP composites $S_1(t)$ under the AFT model we can use the formula $$S_1(t)=S_0(t/\gamma) \tag{2.7}$$ so the survival probability of GFRP composites at strength t is estimated to be the same as the survival probability of CFRP composites at strength $t/\gamma.$ We will fit the model with a log-normal distribution, using the `coef` function will return the model coefficients $\boldsymbol{\beta}$.
+```{r}
+examplemod<-survreg(surv_object~material, data=tensile,dist="lognormal")
+coef(examplemod)
+```
+The coefficient for GFRP composites is -0.2 so the acceleration towards failure is $\exp(-0.2)=0.819$ so this model estimates that GFRP composites have 0.819 times the strength of CFRP composites, and therefore the survival probability of GFRP composites at strength t is estimated to be the same as the survival probability of CFRP composites at strength t/0.819. As a consequence of this we have that the median strength to failure in GFRP composites is 0.819 times the median  strength in CFRP composites; we have an 18% reduction in the median.   
+
+## Plotting AFT model predictions
+
+AFT model predictions can be plotted on top of Kaplan-Meier curves as a visual method of assessment. These plots also illustrate the location and scale parameters more clearly. I have written the `gatherAFTpred` function, available in the online code repository on github, to aid in plotting AFT model predictions. Using this function will gather predictions from a `survreg` object into a new data frame which can then be used to plot the predicted survival curves on top of a `ggsurvplot`. Once the file for the function is in the current working directory the function can be loaded to the global environment by the following command.  
+```{r}
+source("gatherAFTpred.R")
+```
+The function takes the following arguments:
+
+* `fitAFT`, a `survreg` object, this is the AFT model to be used for predictions.
+
+* `data`, the data set.
+
+* `x`, a list of the explanatory variables on the right hand side of the model formula.
+
+Using the tensile data as an example of the use of this function, if we wished to plot the formula `surv_object ~ material + stacking` we would first create the Kaplan-Meier estimator with `survfit` and then create the `ggsurvplot`: 
+```{r}
+#create ggsurvplot first
+KMmatstack <- survfit(surv_object~material+stacking, data=tensile) #KM object
+exampleplt = ggsurvplot(KMmatstack, data=tensile, legend="bottom") + 
+  xlab("Tensile strength") + 
+  ggtitle("material + stacking, Weibull predictions") + # set up title
+  guides(colour = guide_legend(title="Kaplan-Meier:",ncol=2)) # set 2 legend columns
+```
+Next we create the AFT model with `survreg`, we will use a Weibull distribution.
+```{r}
+fitAFT <- survreg(surv_object~material+stacking, dist="weibull", data=tensile)
+```
+Then finally we create the data frame of model-predicted values and add the predicted lines on top of `exampleplt$plot`. The created data frame will always contain the same three columns:
+
+* `x`, the positive quantity being used as the time-to-event dependent variable, in this case strength. We want to plot this on the x-axis.
+
+* `y`, the column of percentiles from 0.99 to 0.01 to be plotted on the y-axis as the survival probability percentiles.
+
+* `combination`, the combination of explanatory variables corresponding to the values and probabilities. The data frame is in long form so there will be 99 rows for each combination corresponding to the 99 percentiles being plotted. This is the variable we will use to group the data by in the plot, and also colour code by. 
+
+```{r,fig.height=6,fig.cap="gatherAFTpred example plot"}
+pred_df <- gatherAFTpred(fitAFT, tensile, x=c("material","stacking"))
+exampleplt$plot = exampleplt$plot + geom_line(data=pred_df, 
+                                aes(x=x, y=y, group=combination,colour=combination)) 
+exampleplt
+```
+In these plots such as Figure 7 we can clearly see the labeled survival curves just like we have seen previously with the addition of the predicted survival curves from our `survreg` model. It can be seen that the predicted curves all follow a very similar shape and this is due to the shared scale parameter in the AFT models, the distance between each predicted curve is caused by the differences in location parameters. From this plot we can see that CFRP composites with 0/90/30/-60 stacking sequence result in the strongest composite laminates and are also the strongest predicted composites.  
+The weakest composites based on the empirical evidence are both material types with 30/-60/60/-30 stacking sequences however according to the model the GFRP composite is estimated to be weaker than the otherwise equal CFRP composite. This demonstrates that information is shared between curves as the two strongest composite types are CFRP so the model predicts that CFRP composites will always have a higher median strength than the GFRP counterpart. This is an important feature of the data which we will come back to later as the model has to take an average of the effect of material between the clear lack of differences for 30/-60/60/-30 composites and the much larger differences between the material types for the other two stacking sequences.  
+We have to be careful when plotting with numeric or continuous variables such as strain rate in this data set as `ggsurvplot` will plot these as if they were factor variables. So for numeric variables with many unique values the plots can become quite cluttered if there are too many different combinations of the variables, also, with many variables there will be many subgroups and it is likely that several subgroups will have very few observations meaning that the plots will be both cluttered and non-informative.  
+If too many lines are needed to be plotted the legend for the plot may take up too much of the figure space or can get cut off, this can be somewhat managed by changing the `fig.height` or `fig.width` arguments at the beginning of the r chunk. As a demonstration of this, in order to draw the plot for a model with formula `surv_object ~ material + strain_rate` it is necessary to specify `fig.height=8` in the r chunk as the legend will otherwise take up too much space. In some cases where we want to observe the fit but are not too interested in identifying which curve is which we can just remove the legend instead.  
+```{r, fig.height=8, fig.cap="Numeric variable legend example"}
+# create ggsurvplot first
+KMmatstrain <- survfit(surv_object~material+strain_rate, data=tensile)
+plt = ggsurvplot(KMmatstrain, data=tensile, legend="bottom") + 
+  xlab("Tensile strength") + 
+  ggtitle("material + strain_rate, Weibull predictions") + # set title
+  guides(colour = guide_legend(title="Kaplan-Meier:",ncol=2)) # set 2 legend columns
+# create survreg object
+fAFT <- survreg(surv_object~material+strain_rate, dist="weibull", data=tensile)
+# gather predictions
+pred_df <- gatherAFTpred(fAFT, tensile, x=c("material","strain_rate"))
+# add prediction lines
+plt$plot = plt$plot + geom_line(data=pred_df, 
+                                aes(x=x, y=y, group=combination,colour=combination))
+plt
+```
+The plot in Figure 8 appears to demonstrate a reasonably good fit to the model but it is hard to tell as the data is too coarse making it a little harder to follow which predicted lines correspond to which survival curves. The GFRP composites at 0.0083 strain rate are clearly shown to have the lowest tensile strengths and lowest predicted strengths as well, while the CFRP composites at 542 strain rate are predicted to be the strongest.  
+This wrapper function uses the `predict` function in order to make the model predictions, `predict` will always require two essential arguments, the first is a model object and the second is a `newdata` object, which can be any common data structure, containing the variable values which the model is desired to predict for. More specific details can be obtained for using this function with AFT models in the `predict.survreg` R documentation. For quantitative variables this function can also be used to predict outside of the observed data values, for example if we were interested in the predicted survival probabilities when the strain rate reaches 600 or higher we only need to specify the strain rate value in the `newdata` object and `predict` will return the desired predictions. This makes predicting with AFT models quite flexible and it is possible to extrapolate to some extent if so inclined.  
+Now let's take a closer look at the estimated parameters within the models. We will look at the full model `surv_object~material+strain_rate+stacking` for all examples.
+\pagebreak
+
+### Exponential
+
+Fitting our model with `survreg` we will first look at the exponential distribution, this is a very basic model where the scale parameter is fixed at 1.   
+```{r}
+expmod <- survreg(surv_object~material+strain_rate+stacking, dist = "exponential",data=tensile)
+coef(expmod) 
+```
+The model outputs a coefficient for GFRP material but not one for CFRP, this is because material is a factor variable and the default is to take the level which comes first alphabetically as the reference level. Similarly the stacking level for the combination "0/90/30/-60" has been taken as a reference due to alphabetical order.  
+The coefficients given for AFT models are logarithms of ratios of median strength when all other variables are held constant, they measure the acceleration towards failure. This means that the coefficient for `materialGFRP` is the logarithm of the ratio of median strength of GFRP composites compared to CFRP composites with other variables held equal. From the model output we have that a GFRP composite is expected to have 18% lower tensile strength ($\exp(-0.1999)=0.8188$) than a CFRP composite. If GFRP were to be set as the reference level then we would have ended up with a ratio of $1/0.8188=1.2213$ indicating that CFRP composites are expected to have 22% higher tensile strengths than GFRP composites.  
+Strain rate has a different interpretation since it is a numeric or continuous variable, for numeric variables we do not interpret in terms of levels but in terms of unit increases in value. According to this model we have that as strain rate increases by 1 the median strength of the composite is increased by 0.09% ($\exp(0.0009)=1.0009$). It is essential to note that although this estimate may seem like the strain rate effect is negligible it is the effect of a single unit increase. The scale of a covariate can be very influential as we would usually consider increases in strain rate on a larger scale. An easier way to interpret this number is that an increase in strain rate of 100 is expected to show a 9% increase in the tensile strength.  
+The stacking coefficients have a similar interpretation to the material coefficient, the coefficient for the sequence "0/90/45/-45" indicates that composites with this stacking sequence are likely to fail 12% sooner ($\exp(-0.1276)=0.8802$) than  "0/90/30/-60" stacked composites and "30/-60/60/-30" composites are likely to fail 55.3% sooner ($\exp(-0.8048)=0.4472$).  
+As previously mentioned plotting can be a useful way to visually check a model's fit, we will remove the legend in order to plot this as the full model has too many combinations and we are only interested in overall fit. We will also set `legend="none"` as we do not need to see the legend as we are only doing a quick visual check of the model fit. We will examine the same plot for each distribution, this plot will be cluttered as there are 42 different combinations of the explanatory variables in this model.
+```{r,fig.cap="Exponential model predictions"}
+KMfull <- survfit(surv_object~material+stacking+strain_rate,data=tensile)
+expplt = ggsurvplot(KMfull, data=tensile, legend="none") + 
+  xlab("Tensile strength") + 
+  ggtitle("full model, exponential predictions") 
+pred_df <- gatherAFTpred(expmod, tensile, x=c("material","stacking","strain_rate"))
+expplt$plot = expplt$plot + geom_line(data=pred_df, 
+                                aes(x=x, y=y, group=combination,colour=combination))
+expplt
+```
+It is immediately clear from Figure 9 that the exponential distribution is not appropriate for the tensile data but this is a very simple distribution to use and may fit well to other data, we should expect the next distribution to fit this data better. One issue with this model formula which we can spot here is that each survival curve is fit on only three data points, since there are three steps in the Kaplan-Meier curves, and one of those points is when the survival probability is equal to 1. We will return to this issue later in the goodness of fit section.  
+
+### Weibull
+
+The Weibull distribution is a more complex version of the exponential distribution as the scale parameter is allowed to vary, when the scale is equal to 1 the two distributions are identical. The Weibull is one of the most commonly used distributions in survival analysis and it is often the only distribution considered in statistical analyses especially when it comes to reliability testing in Engineering such as the paper that the tensile data was obtained from (Naresh, Shankar and Velmurugan, 2018). It is certainly a versatile and useful distribution which may often be the best choice but in order for statistical analysis to be robust it is important to consider other options.  
+This time, once we have created our model with `survreg`, we are going to use the `tidy` function from the `tidyverse` package, this is also used to summarise model coefficients including the estimated scale parameter but also several other values used in hypothesis testing and model selection. For now we are only interested in the estimated coefficients column.
+```{r}
+weimod <- survreg(surv_object~material+stacking+strain_rate, dist="weibull", data=tensile)
+tidy(weimod) %>% kable(caption="Weibull model output",digits=4) %>%
+  kable_styling(full_width = F)
+```
+There is a noticeable difference in coefficients compared to the exponential model in Table 2, the strain rate coefficient has reduced indicating that an increase in strain rate of 1 unit will increase the median tensile strength of a composite by 0.08%. The material coefficient has remains very similar at -0.198  which means GFRP composites are still expected to fail 18% sooner ($\exp(-0.198)=0.820$) than CFRP composites with this model.  
+The stacking coefficients have also both increased slightly and indicate that a "0/90/45/-45" composite is expected to fail only 9.6% faster ($\exp(-0.101)=0.904$) than the reference "0/90/30/-60" composites and "30/-60/60/-30" composites are expected to fail 53.2% sooner ($\exp(-0.760)=0.468$).  
+Finally the biggest difference from the exponential model is that we also have a scale parameter of $\exp(-2.483)=0.083$ which is very different from 1, further highlighting the unsuitability of the exponential distribution for this data set. The scale parameters of differently distributed AFT models are not directly comparable and are mostly used for diagnostics. 
+```{r,fig.cap="Weibull model predictions"}
+weiplt = ggsurvplot(KMfull, data=tensile, legend="none") + 
+  xlab("Tensile strength") + 
+  ggtitle("full model, Weibull predictions") 
+pred_df <- gatherAFTpred(weimod, tensile, x=c("material","stacking","strain_rate"))
+weiplt$plot = weiplt$plot + geom_line(data=pred_df, 
+                                aes(x=x, y=y, group=combination,colour=combination))
+weiplt
+```
+Plotting the fit with a Weibull distribution in Figure 10 shows a dramatic improvement in the fit as we can see that this model fits much better. Even though it is not perfect this would be a model to evaluate further. The actual plot here is not particularly useful due to the coarseness of the data, there are too many unique groups which need to be plotted and this causes an extremely cluttered plot.  
+One way to fix this is to only plot a subset of the data. Strain rate is the variable which takes the most values so we could reduce the clutter on this point by only plotting a few values of strain rate instead. The model can still be fit on all of the data, we just do not need to plot the Kaplan-Meier curves or predictions for all of the data. We will do this by creating a new data frame object for plotting which is a simple subset of the full data for only three values of strain rate, we will use the smallest, median, and largest values.
+```{r}
+plotdf <- subset(tensile, strain_rate==0.0083 | strain_rate==384 | strain_rate==542)
+```
+We then use this smaller data frame to create a `survfit` object for a subset of the Kaplan-Meier curves and we can plot these with the same method as before.
+```{r}
+subKMfull <- survfit(Surv(strength,status)~material+stacking+strain_rate, data=plotdf)
+weiplt2 = ggsurvplot(subKMfull, data=plotdf, legend="none") + 
+  xlab("Tensile strength") + 
+  ggtitle("Subset: full model Weibull predictions")
+```
+We then use the same commands as before to get the predicted values data frame, using the `survreg` object which was fit on all of the data but only gathering predictions for the subsetted data. We then add the predicted curves on top of the Kaplan-Meier plot like before.
+```{r, fig.cap="Weibull model predictions, subset plot."}
+pred_df <- gatherAFTpred(weimod, plotdf, x=c("material","stacking","strain_rate"))
+weiplt2$plot = weiplt2$plot + geom_line(data=pred_df, 
+                                aes(x=x, y=y, group=combination,colour=combination))
+weiplt2
+```
+The plot in Figure 11 is still cluttered but gives us a better idea of the actual fit which appears worse than in the previous plot, this is because the previous plot was so cluttered that even predictions which missed the mark completely, like several of the predicted lines do here, ended up on top of other survival curves. This subset plot is more useful so we will continue to only plot a subset of the data in future examples.  
+We could include the legend for the plot in Figure 11 as there are now only 18 pairs of Kaplan-Meier and predicted curves instead of 42 but realistically, identifying which curve is which will still be difficult and the plot alone gives us a good enough idea of the fit. The shape of the curves fits much better with the Weibull distribution but the location of the curves would be something to improve upon.
+\pagebreak
+
+### Log-logistic
+
+The log-logistic is another strong option for choice of distribution, where now the assumption is that $Z$ follows a logistic distribution. The method of interpretation of model coefficients remains the same across all AFT models despite this change.
+```{r}
+llmod <- survreg(surv_object~material+stacking+strain_rate, dist="loglogistic", data=tensile)
+tidy(llmod) %>% kable(caption="Log-logistic model output",digits=4) %>% 
+  kable_styling(full_width = F,latex_options="hold_position")
+```
+The coefficient estimates in Table 3 for this distribution remain similar to the ones we have seen so far. The strain rate coefficient is back to 0.0009 in this model and the material coefficient has reduced slightly and now suggests that GFRP composites are expected to break 18.5% sooner ($\exp(-0.205)=0.815$).  
+The stacking coefficients are closer to the exponential estimates predicting that "0/90/45/-45" will have 12% lower tensile strength ($\exp(-0.126)=0.882$) and "30/-60/60/-30" composites will have 55.5% lower strength ($\exp(-0.809)=0.445$) than "0/90/30/-60" stacked composites.
+```{r,fig.cap="Log-logistic model predictions"}
+llplt = ggsurvplot(subKMfull, data=tensile, legend="none") + 
+  xlab("Tensile strength") + 
+  ggtitle("Subset: full model log-logistic predictions") 
+pred_df <- gatherAFTpred(llmod, plotdf, x=c("material","stacking","strain_rate"))
+llplt$plot = llplt$plot + geom_line(data=pred_df, 
+                                aes(x=x, y=y, group=combination,colour=combination))
+llplt
+```
+At first glance the plot in Figure 12 for the log-logistic looks very similar to the Weibull plot but there are some minor differences, especially at the very bottom of the plot as the probabilities approach 0, this is due to the more asymptotic behaviour of the log-logistic distribution. Clearly the plots alone are not enough to determine which model actually fits better and there is a need for further testing of this model as well. 
+
+### Log-normal
+
+The log-normal is another very common distribution which is a strong candidate, it assumes that $Z$ follows a standard normal distribution. This model tends to perform quite similarly to the log-logistic and Weibull in a lot of cases.
+```{r}
+lnmod <- survreg(surv_object~material+stacking+strain_rate, dist="lognormal", data=tensile)
+tidy(lnmod) %>% kable(caption="Log-normal model output",digits=4) %>%  
+  kable_styling(full_width = F,latex_options="hold_position")
+```
+The coefficients of the log-normal in Table 4 are all very close to those in the log-logistic model and in fact the individual effects of each variable are found to be the same in both models when rounded to 2 significant figures. The scale parameters in these models do not affect the predicted effects of the explanatory variables and are not directly comparable so there is not much to say about them at this point.
+```{r,fig.cap="Log-normal model predictions"}
+lnplt = ggsurvplot(subKMfull, data = plotdf, legend="none") + 
+  xlab("Tensile strength") + 
+  ggtitle("Subet: full model log-normal predictions") 
+pred_df <- gatherAFTpred(lnmod, plotdf, x=c("material","stacking","strain_rate"))
+lnplt$plot = lnplt$plot + geom_line(data=pred_df, 
+                                aes(x=x, y=y, group=combination,colour=combination))
+lnplt
+```
+The plot for the log-normal in Figure 13 is again extremely close to the previous plots with very minor differences between them and it is clear that we need to use other methods to determine which model has the better fit.
+
+## Goodness of fit: Accelerated Failure Time models
+
+In the previous plots we have the issue that the predicted survival curves tend to degenerate at 0 and at 1 which can sometimes obscure the fit, the methods and plots in this section will help to alleviate that issue and give a better assessment of fit.   
+One method of goodness of fit assessment is to continue from the AFT model equation $$S_T(t)=P\left(Z>\frac{\log(t)-\mu}{\sigma}\right)=S_Z\left(\frac{\log(t)-\mu}{\sigma}\right)$$
+If we apply $S_Z^{-1}$ to each side of the equation then we obtain a linear function
+
+$$S_Z^{-1}(S_T(t))=\frac{1}{\sigma}\log(t)-\frac{\mu}{\sigma} \tag{2.8}$$
+This means that if we plot $\log(t)$ against an estimate of $S_Z^{-1}(S_T(t))$ we should get a straight line. Since $S_Z$ is completely known, we can use $S_Z^{-1}(\hat{S}_T(t))$ where $\hat{S}_T$ can be simply taken to be the Kaplan-Meier estimator. In a good fit for an AFT model we would also be looking for the lines corresponding to different group combinations being parallel so in plots we are hoping to see straight, parallel lines.  
+
+The inverse  survival functions $S_Z^{-1}$ are given by:
+
+* If $Z$ has a standard normal distribution then the inverse  survival function is `qnorm(1-p)`
+
+* If $Z$ has a logistic distribution then  the inverse  survival function is `qlogis(1-p)`
+
+* If $Z$ has a smallest extreme value distribution then the inverse  survival function is `qextr(1-p)` which has been coded as it does not exist already in R, it is very simple but it is also available in the github code repository and can be loaded in using the `source` function the same way `gatherAFTpred` was.  
+Now if we plot $\log(t)$ against these functions we can check the plots for linearity to assess the goodness of fit of each model. 
+
+### Goodness of fit plots
+
+I have coded a simple wrapper function to make these plots of $\log(t)$ against $S_Z^{-1}(\hat{S}_T(t))$ called `gofplot`, this is also available on github and can be loaded in using the `source` command. This function takes the following arguments:
+
+* `fit`, a `survfit` object which has been defined, this is the Kaplan-Meier estimator
+
+* `dist`, one of the location-scale distributions to be checked, note that since the exponential distribution is contained within the Weibull we do not have a plot for the exponential since the fit will never be better than that of the Weibull.  
+In the previous sections we examined the model output of the full model `surv_object ~ material + stacking + strain_rate` so we will start with the `gofplot` of this model.  
+```{r,fig.height=6, fig.width=10, fig.cap="Goodness of fit plots for each distribution with the full model"}
+source("qextr.R")
+source("gofplot.R")
+par(mfrow=c(2,2))
+gofplot(KMfull,"weibull")
+gofplot(KMfull,"lognormal")
+gofplot(KMfull,"loglogistic")
+```
+Now there is a significant problem with these plots in Figure 14. In the tensile data there are three observations for each combination of explanatory variables, due to to the method used to create this plot there is actually a point missing and we only have two points for each combination of the variables. This is a result of modelling with probability distributions, in fact this plot is almost identical to the plots made in the original tensile data paper (Naresh, Shankar and Velmurugan, 2018) except the researchers plotted the points in isolation rather than using probability distributions so they did not lose their third point. The method used to fit the lines involved fitting unique Weibull shape and scale parameters to each unique combination of the data, the resulting parameters found with this method would describe the data very well but would be so specific to the observed values that they cannot be generalized; much like the Kaplan-Meier estimates. The models showcased in this tutorial are more statistically robust as we are pooling data from all groups together in our estimations.  
+The reason why a point has been lost here is because for each unique combination of explanatory variables the survival probabilities are estimated at each value of strength where a composite failed. This means, when there are only three observations for each combination, that at the first point where a composite failed the survival probability is estimated as $\frac{2}{3}=0.67$ since at that point there are two subjects remaining out of the three that started and no observations were censored. Then at the value where the next composite failed the survival probability is $\frac{1}{3}$ and when the last composite fails the survival probability is 0. In data sets without censoring this will be the general pattern of survival estimates for each unique combination of explanatory variables as these estimates are empirical, based only on the data provided. Now when we take the inverse functions of any of the probability distributions and evaluate them at $1-0=1$ the values are going to be infinite, which means the last point will be omitted from the plot.  
+This presents an issue when there are not enough observations for each combination of explanatory variables such as in the tensile data set as drawing a straight line between any two points is trivial. In general we would call models such as these "saturated", for the tensile data any models with this formula would be considered saturated. There is a similar problem with the plots in the original tensile data paper (Naresh, Shankar and Velmurugan, 2018) where a straight line has been fitted to only three points which is also almost trivial to do as long as there is some correlation. In a saturated model the straight line fit is essentially guaranteed and the reason this formula creates a saturated model is because three observations at each unique combination is not enough so we would critique the design of this experiment and suggest that more repetitions are necessary for this model to be more useful.  
+
+That being said, the plots we have in Figure 14 are good because even though we cannot comment on linearity the lines are close to being parallel, which is the ideal result which would occur if the distribution fit the data perfectly with no extra variation so that any changes in log(t) could be explained completely by the difference in the explanatory variable values. The slopes are also similar across all of the groups which means that the variation within groups stays similar and low, lower variation within a group would create a more vertical slope and higher variation would decrease the slope.  
+Overall, with this model formula, each distribution appears to have a very good fit to the data and they remain almost inseparable in terms of which distribution fits the best so more testing would still be required to definitively say which is optimal. Due to the saturation of models with this formula we should also consider alternative model options with fewer variables as the data wll be less saturated.   
+Logically, if we wish to remove a variable from this model we would choose `strain_rate` since it is still a control variable and the material and stacking sequence differences are of more interest. Doing so leaves us with a new model to assess with formula `strain_rate ~ material + stacking`. Now if we plot the goodness of fit we should get much more useful plots.    
+```{r,fig.height=6,fig.width=10, fig.cap="Goodness of fit plots for a less saturated model"}
+KM<-survfit(surv_object ~ stacking+material, data=tensile)
+par(mfrow=c(2,2))
+gofplot(KM,"lognormal")
+gofplot(KM,"loglogistic")
+gofplot(KM,"weibull")
+```
+With this less saturated model we now have 6 unique combinations for material and stacking sequence so instead of only 3 points to fit there are 21 including the largest strength values for each combination which are lost to infinity. Fitting a straight line to this many points is much more difficult. In Figure 15 we can see each of the 3 distributions have very similar fit again. The relationship in each plot is clearly overall non-linear but a few lines do look close to piecewise linear as the fit could easily be two separate straight lines with different slopes meeting in the middle. The top half of the plots generally show a very good linear fit for each distribution and the lower half of the points also appear to follow a straight line, the discrepancies occur in the centre where the two lines would meet. This effect appears to be mainly due to the few lowest values of the inverse probability distributions, these occur at high survival probability and therefore we can deduce that they belong to the composites in each group which failed at lower strengths. The piecewise linear appearance of the data as it stands could suggest that these distributions do fit very well but the model requires a separate fitting for the lower values.  
+Strain rate is likely to blame for this effect since the composites which failed earlier tended to do so at lower strain rates, looking closely at the plots it also appears to be mainly the lowest three points which are out of sync. This is likely due to the range of the strain rate variable and the intervals that were measured, this would be another critique of the original experiment design. 
+```{r}
+unique(tensile$strain_rate)
+```
+The first strain rate value is 0.0083 and the second jumps up to 221, after this the strain rate increases by less than 100 each time. The large jump from 0 to 221 is a significant gap and is one that calls for more repetitions of the experiment to occur at a strain rate in between these values. With observations in between these levels of strain rate these plots would likely stretch out as the extra points might connect the two piecewise lines into one straight line. There are several ways in which it could be done but the crucial design improvement to make here is creating more even intervals between values.  
+As the standalone plots we have in Figure 14 it has to be said that overall the most linear fit belongs to the Weibull distribution as the other two distributions appear to have slightly more accentuated curves. So of the three that we have examined the Weibull distribution appears to fit the data the best.
+
+## Testing between nested models
+
+With strain rate likely to blame for the non-linearity in the plots in Figure 14 the usual response would be to include strain rate in the model formula so that the strain rate differences are accounted for. The formula without strain rate is "nested" in the larger model formula since it uses a subset of the larger model's explanatory variables. There are statistical tests that we can perform for formal hypothesis testing between two nested models; the test we are going to look at uses the log-likelihood and is a test that works between any two nested models as long as the likelihood exists.   
+The likelihood is a mathematical function which is used to calculate the joint probability of observing all dependent variable values and is essentially a measure of evidence. The maximum likelihood estimates are obtained by maximizing the likelihood so that, under the assumed probability distribution, the observed data is most likely to occur, and the logarithm of this is most often used to make computations more manageable. In general we look for the higher values of the log-likelihood as these indicate the better models. For nested models the larger model will always have a higher log-likelihood, however the difference between them is not always significant as the log-likelihoods need to be adjusted depending on the degres of freedom in a model which is will increase as more variables are included and more paramters need to be estimated.  
+The likelihood ratio test is defined as: $$2(\hat{l}_{full}-\hat{l}_{reduced}) \tag{2.9}$$ where $\hat{l}_{full}$ is the log-likelihood for the "full" model and $\hat{l}_{reduced}$ is the log-likelihood of the reduced version of that model, in general we consider the "full" model to be the larger, more saturated of the two nested models being compared. The function `logLik` can be used to extract the log-likelihood of a fitted model. So we can start to conduct a likelihood ratio test for the inclusion of strain rate in our Weibull model by defining the reduced model and then calculating the test statistic.
+```{r}
+weimodr <- survreg(surv_object~material+stacking, dist="weibull", data=tensile)
+logLik(weimod)
+logLik(weimodr)
+```
+So our test statistic is $2*(-583.53+649.38)=131.7$. This test statistic is then compared against a chi-squared distribution with degrees of freedom equal to the difference in degrees of freedom between the two models which is 1 in this case.
+```{r}
+pchisq(131.7, df=1, lower.tail=F)
+```
+The resulting p-value demonstrates that the strain rate is highly statistically significant and the full model is a significant improvement on the reduced model. The standard significance level in statistics is 5% so anything below 0.05 would be considered significant. This full process can be achieved faster using the `anova` function with the smaller model as the first argument and the larger model as the second.
+```{r}
+anova(weimodr,weimod)
+```
+  
+Another highly important tool for model diagnostics is the `summary` function from base R, this function outputs all the necessary information about a model in one place. It first outputs the call and the estimated coefficients which should be familiar by now but we will now go through what the rest of the columns mean.  
+```{r}
+summary(weimod)
+```
+The 2nd column is the standard error of the estimated coefficient which should be a familiar concept. The 3rd column called "z" here is named depending on the name of the test statistic and can vary depending on the context of the model. The test statistic is used in hypothesis testing for the significance of a variable but is only valid for large samples and approximate for small samples. These tests are generally structured as a test between the null hypothesis $$H_0: \beta=0$$ and the alternate hypothesis $$H_1: \beta\neq0.$$ In this `survreg` model the test statistic is $$Z=\frac{\hat{\beta}-0}{s}$$ where $\hat{\beta}$ is the estimated coefficient and $s$ is the estimated standard error. This statistic is then tested against a standard normal distribution and the resulting p-value in the 4th column is the probability of having test results at least as extreme as the observed results given that the null hypothesis is true. This essentially means that the lower the p-value column is the more evidence there is that the unknown coefficient is not actually zero and therefore insignificant to the model. This model in particular has every coefficient as statistically significant.  
+Below the main table `summary` also gives several other statistics such as the log-likelihood, the log-likelihood for the null model, which is the model with formula `surv_object~1`, and the test results for the hypothesis test between the two. It is no surprise that the p-value is so small as the null model is the smallest possible reduced model and we already know this model is a significant improvement on the reduced model excluding strain rate thanks to the previous likelihood ratio test. 
+
+## Interaction terms
+
+We will now refer back to an early observation made in reference to Figure 7, in the plot we noticed that the AFT model was underestimating the survival probabilities of CFRP composites with 0/90/45/-45 and 0/90/30/-60 stacking sequences but overestimating the 30/-60/60/-30 composites. This is due to the pooled data when calculating the estimated coefficients where the model has to take an average effect of material despite the clear differences in material effect for different stacking sequences. To account for this effect we can use an interaction term in a model which will cause the model to estimate two more paramters which allow for different material effects depending on what the stacking sequences is. To do this, in the model formula we include an extra term `material:stacking` to represent the interaction between them, this can also be achieved, if both variables are also included in the model on their own, by using `material * stacking` which is equivalent to using `material + stacking + material:stacking`.
+```{r}
+intweimodr <- survreg(surv_object~material*stacking, dist="weibull", data=tensile)
+tidy(intweimodr) %>% kable(caption="Weibull interaction model output",digits=3) %>% 
+  kable_styling(full_width = F,latex_options="hold_position")
+```
+The model output in Table 5 shows two additional rows for the two additional parameters estimated, interaction terms can also change the interpretations of other coefficients. For example, the `materialGFRP` coefficient now represents the effect of material only for the reference level of stacking. So when we consider only 0/90/30/-60 composites GFRP composites are expected to fail 16.5% sooner ($\exp(-0.180)=0.835$) than CFRP composites. If we consider other levels we have to use both the `materialGFRP` coefficient and the interaction coefficient to calculate the expected effect of differing materials so for 0/90/45/-45 composites we would do:$\exp((-0.180)+(-0.132))=0.732$ and interpret from that that 0/90/45/-45 stacked GFRP composites are expected to fail 26.5% sooner than 0/90/45/-45 stacked CFRP composites. The difference in the effects here looks promising for our model because the strength difference caused by the material is clearly not the same for all stacking sequences.  
+There is a simple way to check for the significance of the interaction because models without an interaction between two of the variables are nested within models which include an interaction term. For example our reduced model `weimodr` which does not include strain rate, is nested within our `intweimodr`. This means we can test for the significance of the interaction term using the `anova` function like before.
+```{r}
+anova(weimodr,intweimodr)
+```
+From this result we can conclude that the interaction is significant, but if we wanted to compare between this interaction model and the previous full model which does not include an interaction but does include strain rate then we cannot use the same test.  
+
+## Testing between non-nested models
+
+Models are called "non-nested" if neither model can be obtained by adding restrictions to the other such as removing an explanatory variable. For example in our data, two models with formulae `surv_object ~ material + strain rate` and `surv_object ~ material + stacking` would be non-nested as neither is contained within the other. Similarly, the interaction model introduced in the previous section and the saturated model, which has no interaction but includes strain rate, are also non-nested.    
+The likelihood ratio test or ANOVA tests would not work correctly for comparing these models so instead we use the Akaike Information Criterion, or AIC, which is given by $$AIC=-2l(\hat{\beta})+2p $$ where $l(\hat{\beta})$ is the log-likelihood function as before and $p$ is the number of parameters for that model. This quantity is a measure of goodness of fit but it also balances with the complexity of a model since adding more parameters to a model will never decrease the log-likelihood but the AIC allows us to check if adding the extra parameter makes a significant enough difference. When examining the AIC we are looking for the lowest value which indicates the best model.   
+Since the interaction model and the previous saturated model are non-nested we compare them by calculating their respective AIC values using the `AIC` function.
+```{r}
+AIC(weimod)
+AIC(intweimodr)
+```
+This result tells us that strain rate is more important to include in the model than the interaction term between material and stacking since the model with strain rate has a lower AIC than the interaction model.  
+The next step would be to create a model which includes both the strain rate and the interaction term and test for the significance of the interaction term using the likelihood ratio test since our saturated model will be nested inside the larger interaction model.
+```{r}
+intweimod <- survreg(surv_object~material*stacking+strain_rate, dist="weibull", data=tensile)
+anova(weimod, intweimod)
+```
+This result shows that the interaction term is still significant when strain rate is included as well so we should include it in the model.  
+The AIC is also useful when comparing similar models to provide a simple method of checking which model fits the best and for AFT models the AIC can be used to compare which distribution results in the best model fit. We can use it to compare between the three different location-scale distributions which we introduced earlier. 
+```{r}
+AIC(weimod)
+AIC(lnmod)
+AIC(llmod)
+```
+These AIC results demonstrate that there is indeed very little difference between the three model fits but the Weibull AFT model performed marginally better than the others.  
+However, so far our best fitting model includes material, strain rate, stacking sequence, and an interaction between material and stacking sequence. We know this because our likelihood ratio test concluded that including the interaction was an improvement to the full model's fit. So logically we should also create similar models with the other two location-scale distributions and check between them which distribution fits better as accounting for more parameters could change the behaviour of the data.   
+```{r}
+intlnmod <- survreg(surv_object~material*stacking+strain_rate, dist="lognormal", data=tensile)
+intllmod <- survreg(surv_object~material*stacking+strain_rate, dist="loglogistic", data=tensile)
+```
+We can now compare between the three models using the AIC again.
+```{r}
+AIC(intweimod)
+AIC(intlnmod)
+AIC(intllmod)
+```
+Now the AIC results indicate that the Weibull AFT model actually performs worse than the other two distributions when we use this formula. This highlights the importance of being rigorous in the model selection process as we now have that the log-normal version of this model is the best fitting AFT model, with the log-logistic very close behind.  
+
+## Changes for Censored Data
+
+Censored data is very common in time-to-event style data sets and it may seem quite an intimidating obstacle when it comes to analysis for those unaccustomed to dealing with it. Fortunately, using the tools showcased in this tutorial there are very few extra steps that need to be taken in analysis because the functionality of accounting for censored observations is already built in.  
+In order to properly demonstrate the differences between censored and uncensored data it was necessary to create alternate versions of the tensile data set which include artificially censored observations. One version of the censored data contains random censoring and we have already seen this data set used in the plots in previous chapters, the other censored data set contains type I censoring.  
+Different types of censoring can have different effects on model estimates so we shall examine the differences in both censored data sets. The first difference that was present in the previous censoring example but not mentioned is that the Kaplan-Meier curves drawn for censored data have crosses plotted at every point where censoring occurred. These can be clear indicators of what type of censoring is present as we would expect random censoring to see censored observations spread much more evenly across the data compared to type I censoring where we would expect to see many censored observations occur at the same or similar values.
+```{r,echo=FALSE,fig.height=6,fig.width=10,fig.cap="Censored data plots"}
+KMrand <- survfit(Surv_cens_rand~material,rc_tensile)
+KMtyp1 <- survfit(Surv_cens_max~material,mc_tensile)
+KMmat <- survfit(surv_object~material,tensile)
+p1<-ggsurvplot(KMrand,conf.int = TRUE)+xlab("tensile strength")+ggtitle("Random")
+p2<-ggsurvplot(KMtyp1,conf.int = TRUE)+xlab("tensile strength")+ggtitle("Type I")
+p3<-ggsurvplot(KMmat,conf.int = TRUE)+xlab("tensile strength")+ggtitle("Original")
+arrange_ggsurvplots(list(p1,p2,p3),nrow=2)
+```
+Due to its random nature it is hard to guess what the effect of random censoring would have on model coefficients but one aspect which is quite certain is that the precision of estimates would reduce as we know that a value is greater than the censored value but not by how much, hence we would expect a larger standard error hence and wider confidence bands. Comparing the random censored and original plots in Figure 16 we do notice wider confidence bands as the tensile strength increases.  
+On the other hand there are no differences between the original and type I censoring graphs except that the censored graph is cut off at 400MPa tensile strength which for the context of the type I censored data would be the maximum capacity of tensile strength measurement of the machine used in the experiment. Most of the data is unaffected by this censoring but the strongest materials were all required to be censored at this value which means some of the strongest explanatory variable combinations may have resulted in only censored observations. From this we would expect that the variable combinations responsible for the strongest composites and were estimated to have the largest increase on median tensile strength may have changes in coefficients in a type I censored model than they would have been without censoring.  
+We can illustrate this by comparing any of our original data set model outputs with an equivalent model output from the censored data. To do this we just need to use `Surv_cens_max` as the subject of the model formula as this is a `Surv` object for but with simulated type I censoring added by editing the strength and status variables.  
+```{r}
+modt1 <- survreg(Surv_cens_max ~ material+stacking+strain_rate, dist = "weibull",data=tensile)
+tidy(modt1)
+```
+In this model with type I censoring we see that each coefficient has shifted slightly and that the standard errors have all increased due to the presence of censoring. The strain rate coefficient has increased to 0.00081 from 0.00089 indicating a larger estimated effect on median tensile strength. The stacking coefficients remain effectively unchanged but the material coefficient has reduced by around 0.03 indicating that compared to the reference level CFRP composites, GFRP composites are expected to be weaker than in the model without censoring.  Flipping this around, the CFRP composites are expected to be slightly stronger relative to the other composites than in the original data set, this is because while the observations made at the higher strain rates may be censored and a higher proportion of those belong to CFRP composites, there is still complete data available at other values of strain rate and the coefficient can be estimated from these other data points. This is only possible due to the pooling of data as separating observations into distinct categories by explanatory variable combinations and fitting points in isolation would encounter problems here when no events are observed for certain combinations of variables.  
+Now examining the effect of random censoring on the same model we expect to see small random changes in model coefficients with an increase in standard errors for each parameter. To do this we use `Surv_cens_rand` as the `Surv` object in the model formula as this object has simulated random censoring.  
+```{r}
+modrand <- survreg(Surv_cens_rand ~ material+stacking+strain_rate, dist = "weibull",data=tensile)
+tidy(modrand)
+```
+The coefficients in this model have all been marginally changed again but they have gone in different directions relative to the original model and each estimate now has a larger standard error. This is what we would expect as truly random censoring is less likely to have an impact on the model estimates, we would expect larger estimates when there is a bias towards a certain explanatory variable being more likely to get censored.  
+
+Other goodness of fit methods which were introduced in the previous sections are also still viable for censored data but compared with the original data there may be some more differences.  
+```{r,echo=FALSE, fig.cap="Goodness of fit plot for censored data"}
+KM<-survfit(Surv_cens_rand~ stacking+material
+            ,data=tensile)
+gofplot(KM,"weibull")
+```
+The goodness of fit plot in Figure 17 shows the fit of the Weibull distribution to the Kaplan-Meier which excludes strain rate, in this data set a few lines appear more linear than in the original data set indicating that this censored data would be fit slightly better by the Weibull AFT model than the original data was. There are several horizontal lines between points in this plot where the strength value changes but the estimated survival probability does not, this indicates that censoring has happened.  
+The likelihood still exists in censored data meaning that any tests involving likelihood or log-likelihood are still valid for censored data, this includes the AIC.
+```{r}
+logLik(modrand)
+AIC(modrand)
+```
+The log-likelihood for the Weibull model on the censored data is also higher than the log-likelihood for the original model and the AIC is also lower however these two statistics are not comparable to each other as they are fit on different data sets so it would be inappropriate to compare them.
+\pagebreak
+
+# Chapter 3: Proportional Hazards
+
+The hazard function was introduced at the start of this tutorial in equation 1.2 but has not yet been used. Even though they are closely related by equation ? the instantaneous failure rate may often be more intuitive to use for engineers than the survival probability of a subject, especially in reliability testing contexts.
+
+## Cox proportional hazards model
+
+The Cox proportional hazards model is a semi-parametric model which is incredibly widely used in time-to-event and survival analysis. It is the most standard model for this type of analysis due to it's wide applicability and it is very simple to understand. It is very commonly used in Biostatistics but in Engineering it is barely used and rarely known.
+The model stems primarily from the proportional hazards assumption $$h_1(t)=\psi h_0(t), \tag{3.1}$$ that the hazard of a subject is proportional to the baseline or underlying hazard function. In our specific context for example this would be that the hazard of a GFRP material is equal to some positive quantity times the baseline or reference hazard which would be the hazard of a CFRP material.  
+Using this assumption to find the difference between hazard functions we can then form a model by setting $$\psi=\exp(\beta_1x_1+...+\beta_ix_i). \tag{3.2}$$ So that in a model with formula `surv_object~material` the hazard function of a subject would be $$h(t)=h_0(t)\exp(\beta_1\mbox{GFRP material}). \tag{3.3}$$ 
+The formula clearly demonstrates the derivation of the model name as the hazard for different groups of covariates are all proportional.  
+If we refer back to the form of equation (need) the corresponding hazard functions for the AFT model can be found by simple differentiation to be $$h_1(t)=1/\gamma* h_0(t/\gamma) \tag{3.4}$$ so that the hazard of group 1 at strength t is $1/\gamma$ times the hazard of group 0 at strength $t/\gamma.$ The Weibull distribution is particularly unique in that the Weibull AFT model is equivalent to a proportional hazards model as the proportional hazards assumption holds, this can be shown with equation (3.4) and the probability distribution of the Weibull. $$h_1(t)=\frac{1}{\gamma} h_0(t/\gamma)=\frac{1}{\gamma}*\frac{1}{\sigma}e^{-\frac{\mu_0}{\sigma}}(t/\gamma)^{\frac{1}{\sigma}-1} \tag{3.5}$$ which can be rearranged to find $$h_1(t)=(\frac{1}{\gamma})^{\frac{1}{\sigma}}*\frac{1}{\sigma}e^{-\frac{\mu_0}{\sigma}}t^{\frac{1}{\sigma}-1}=(\frac{1}{\gamma})^{\frac{1}{\sigma}}h_0(t).\tag{3.6}$$ Thus the hazards are proportional with factor $(\frac{1}{\gamma})^{\frac{1}{\sigma}}$, this feature is only present in the Weibull distribution. (Cox and Oakes, 1998)  
+This result means that the Weibull AFT model is an example of a proportional hazards model but this is only one instance, there are many other parametric proportional hazards models as well. One of the strengths of the Cox model is that it takes into account almost all possible parametric proportional hazards models at once, not just the Weibull. This is one of the reasons why it is so flexible as a model and so widely used.  
+The functions that we use to estimate Cox models use very similar syntax to the others we have already seen. We use the function `coxph` and the key arguments are a formula, with a `Surv` object as the subject and the data frame in which the variables named in the formula can be found, there are no distributions needed since the cox model does not assume any underlying probability distributions.
+```{r}
+coxph(surv_object~material, data=tensile)
+```
+The output of `coxph` is noticeably different from the `survreg` summaries we have seen so far. The column we are usually most interested in for cox models is the `exp(coef)` column, this skips the extra step of calculating the exponential of `coef` like we did when using `survreg.` The estimate given here is called the hazard ratio and is interpreted as the ratio of the hazards between the group specified and the reference level for that group.  
+In this case we have a hazard ratio of 2.75 meaning that GFRP composites are observed to be 2.75 times more likely to fail at any given point than CFRP composites, higher hazard means lower survival probability which means this is what we would expect given that previous models have all shown that GFRP composites are likely to fail sooner than CFRP composites.  
+We also have the standard errors and p-values for coefficients but it should be noted that these correspond to the `coef` column, not to the `exp(coef)` column. The p-value is still interpreted in the same way though as conducting a separate test would be redundant. Much like in the AFT models the p-value corresponds to the probability of observing something at least as extreme as the actual data given that the null hypothesis ($\beta=0$) is true.  
+An important difference to note from AFT modelling is that there is no intercept in a cox model as it was designed to allow for estimation of hazard ratios without having to estimate the baseline hazard. This is big strength of the Cox model as it is not possible to make errors in functions which are not estimated and the reason why it is called a semi-parametric model as no underlying distributions are assumed so there are no extra parameters. It can also be a weakness as finding anything beyond the hazard ratios will require the estimation of the baseline.
+Now we will examine the model output of the saturated cox model.  
+```{r}
+coxfull<-coxph(Surv(strength,status)~material+stacking+strain_rate, data=tensile)
+coxfull
+```
+From this output we have some surprising estimates and the new scale in which we interpret is a significant adjustment because we are no longer discussing changes to a mean or median but instead considering proportionality factors. The hazard ratio for material has gotten considerably larger than in the previous example highlighting the need for accounting for the extra variables. This is now 11.7 indicating that GFRP composites are 11.7 times more likely to fail at any given strength value than an otherwise equivalent CFRP composite.  
+It is important to remember for interpretations that these are the estimated effects of changing only one variable between two composites, all other characteristics are held equal. So the coefficient of 11.7 is the estimated hazard ratio between two composites with the same stacking sequences, at the same strain rate, but with different reinforcement materials.  
+The stacking sequence hazard ratios are also very large, 0/90/45/-45 composites are 4.1 times more likely to fail than otherwise equivalent 0/90/30/-60 composites and 30/-60/60/-30 stacked composites are 4975 times more likely to fail at any given strength value than their 0/90/30/-60 counterparts.   
+Finally the strain rate hazard ratio indicates that as the strain rate is increased by 1 the instantaneous failure rate of a composite is multiplied by 0.989, this is the only variable which decreases the hazard rate but this is in line with previous evidence as higher strain rates resulted in higher strength values. This is again reasonably difficult to visualize since a unit increase in strain rate is so small but if we want the ratio for an increase of 100 strain rate we do $0.989^{100}=0.33$ so we would expect an increase of 100 strain rate to result in a composite with 67% lower hazard rate.
+Several of these hazard ratios may seem a little extreme, this is primarily due to the high volatility of hazard ratios causing the ratio to explode to large numbers very quickly. The best example of this is the 30/-60/60/-30 stacking coefficient of 4975, the reason why it is so large is because all of the composites with this stacking sequence failed before even reaching the lowest strength for the reference level composites. The stacking sequence Kaplan-Meier curves can demonstrate this effectively. 
+```{r,fig.cap="Kaplan-Meier curves by stacking sequence"}
+ggsurvplot(KMstack, ggtheme = theme_bw())+ xlab("tensile strength")
+```
+Figure 18 is actually the same as Figure 5 but without the confidence bands plotted, as we can see in the plot all of the 30/-60/60/-30 stacked composites failed before reaching 200MPa tensile strength whereas the reference level 0/90/30/-60 composites only started failing from 200MPa onward, this means that the hazard for these composites was close to zero before 200MPa while the hazard for 30/-60/60/-30 composites would have been large as the failure rate was clearly high. The disparity between the hazards at this time would cause the ratio between them to be very large.  
+Of course, this explains one coefficient but does not explain the others and another reason why the hazard ratios we obtained might seem unexpected is simply that the assumption of a constant proportionality factor, or even the proportionality of the hazards in general, may be wrong. The key advantage of the Cox model is that when the assumptions do hold, the resulting model is very effective and simple to understand. Usually the hazard ratios are the main interest when using cox models but we will also attempt to plot the model predictions for the sake of demonstrating the fit like we did with previous models.  
+
+## Plotting Cox model predictions
+
+In order to get Cox model predictions we can use the `survfit` function again, this time instead of passing a model formula in like we would to create a Kaplan-Meier estimator we can pass a `coxph` object with a `newdata` object containing the data we want to estimate for and `survfit` will then compute the predicted survival function for the Cox model provided. Alternatively, we can use a similar method to AFT models and use the `predict` function with `type="survival"`. For Cox models the method of prediction is actually inverted, instead of estimating the strength values for each survival probability percentile, we provide a list of strength values alongside the other variable values and `predict` returns the estimated survival probabilities for those values. There are extra steps which need to be taken to use this method for Cox models but I have again written a wrapper function `gatherCoxpred`, available on github, to gather the predictions into a data frame in one line of code.
+```{r}
+source("gatherCoxpred.R")
+```
+The function takes the following arguments which are similar to the AFT version of this function:
+
+* `fitCox`, a `coxph` object, this is the Cox model to be used for predictions.
+
+* `data`, the data set.
+
+* `x`, a list of the explanatory variables on the right hand side of the model formula.
+
+For the Cox version of this function we also have some extra parameters which are necessary:  
+
+* `quantity="time"`, this is the name of the time-to-event quantity being measured, the default is set to "time" but for the tensile data we would set this to "strength".
+
+* `event="status"`, this is the name of the event indicator variable, the default is set to "status" so we do not need to specify this argument for the tensile data.
+
+The use of this function is mostly the same as for AFT models but there are some key differences. We would first create the Kaplan-Meier estimator with `survfit` and then create the `ggsurvplot`. We will use the reduced model which does not include strain rate for this example, just as we did in the AFT example in Figure 7. 
+```{r}
+KMmatstack <- survfit(surv_object~material+stacking, data=tensile) #KM object
+coxplt = ggsurvplot(KMmatstack, data=tensile, legend="bottom") + 
+  xlab("Tensile strength") + 
+  ggtitle("material + stacking, Cox predictions") + # set up title
+  guides(colour = guide_legend(title="Kaplan-Meier:",ncol=2)) # set 2 legend columns
+```
+Next we estimate the Cox model with `coxph`.
+```{r}
+coxmodr <- coxph(Surv(strength,status)~material+stacking, data=tensile) # reduced cox model
+```
+Then finally we again create the data frame of model-predicted values and add the predicted lines on top of `coxplt$plot`. The created data frame will again always contain the same three columns:
+
+* `x`, these are values of the positive quantity being used as the time-to-event dependent variable, in this case strength. These are arbitrary values in a sequence to be plotted on the x-axis.
+
+* `y`, the predicted survival probabilities.
+
+* `combination`, the combination of explanatory variables corresponding to the time-to-event values and survival probabilities. The data frame is in long form so there will be 100 rows this time for each combination, this is necessary for the prediction method but is not an issue for the plots themselves. We will again use this variable to group the data and also colour code by. 
+
+```{r,fig.height=6,fig.cap="gatherAFTpred example plot"}
+pred_df <- gatherCoxpred(coxmodr, tensile, x=c("material","stacking"),quantity="strength")
+coxplt$plot = coxplt$plot + geom_line(data=pred_df, 
+                                aes(x=x, y=y, group=combination,colour=combination)) 
+coxplt
+```
+From Figure 19 we can see that the fit is very similar to the equivalent AFT model fit in Figure 7 and the same issues are encountered with CFRP composites being overestimated for 30/-60/60/-30 stacked composites and underestimated for the other two stacking sequences. This likely comes from the constant proportionality assumption between materials skewing data as the difference between materials is almost non-existent for 30/-60/60/-30 stacked composites but the materials differ significantly for other stacking sequences and the estimated proportionality factor has to be an average of the differences. We already know that this issue can be improved upon with an interaction term and we will test whether or not the interaction term is still significant in the next section.
+The method of predicting curves for cox models is different to AFT models and this is why the predicted lines are not quite as smoothed, this can make comparisons with AFT models slightly more difficult but should not be too much of a hindrance. There are also other, more specific diagnostic plots for Cox models which we will demonstrate but making this plot demonstrates how plotting a reduced model may sometimes also provide more useful information which we cannot see when there is too much going on in one plot. 
+
+## Goodness of fit: Cox models
+
+The Cox model has many methods linked to hypothesis testing and model selection and many of these tests can be generalized for testing in other models but ultimately each test is a slightly different form of the test of $H_0: \beta=0$. Some of the methods which we could use for AFT models are not appropriate for the Cox model as it is semi-parametric and does not estimate any underlying distributions, so for example our `gofplots` would not work and we need to use different diagnostics methods. We have already introduced the likelihood ratio test and we will continue to focus on this hypothesis test for nested models and the AIC for non-nested models as these methods are universal.  
+We have already seen from the model output of our `coxfull` model that the likelihood ratio test can still be used for the Cox model and indeed the `anova` function can be used for any tests between nested models. For example we can test for the significance of the interaction term again for the Cox model:
+```{r}
+intcoxmod<-coxph(Surv(strength,status)~material*stacking+strain_rate, data=tensile)
+anova(coxfull, intcoxmod)
+```
+Again we can conclude that the interaction term is a significant improvement on the model so we should include it.  
+Unfortunately the AIC for cox models cannot be compared to the AIC for AFT models since the methods behind the modelling are fundamentally different. The AFT is a parametric model and is completely specified so it is restricted by the estimated parameters. The cox model is semi-parametric so it does not have to estimate the baseline hazard, this is the non-parametric part and is arbitrary. The parametric part is how we specify the effects of the covariates on the hazard like we did in equation 3.3. The parametric part has a likelihood called the partial likelihood, (the theory of the partial likelihood is beyond the scope of this tutorial so will not be discussed here, more details can be found in section 5.3 of (Moore, 2016)) and the non-parametric part essentially has no likelihood. This means that all likelihood calculations are based on the partial likelihood only, and also means that the AIC for semi-parametric models like the Cox model cannot be compared with the AIC for parametric models like the AFT models.
+```{r}
+AIC(intcoxmod)
+```
+The AIC for our interaction cox model is just over half the AIC for our log-normal AFT model with an interaction but because of the fundamental differences between the models we cannot use the two AIC values to determine which model is better.  
+The Cox model does have other diagnostic methods and many of them are built into the `survival` package. The first new method we will look at involves plotting the model residuals. In statistics, a residual is the difference between the actual observed value of an outcome variable and the model predicted value, a good model will in general have small residuals meaning that the prediction was close to the actual outcome. Deviance residuals are a specific type of residuals which are useful for diagnostics, they are obtained through a normalized transformation of raw residuals resulting in a set of residuals which are in theory centered around zero with standard error equal to one. In the `survival` package we can use the function `ggcoxdiagnostics` to create the residual plots for a cox model. When examining deviance residuals in this way we hope to find that the line of best fit through them is a straight horizontal line along the x-axis.
+```{r,fig.cap="Deviance residual plot for intcoxmod"}
+ggcoxdiagnostics(intcoxmod, type = "deviance", ggtheme = theme_bw())
+```
+The deviance residual plot in Figure 20 shows a good fit to the data, the line of best fit is straight and close to zero but there is an overall overestimation of the failure strengths of composites indicated by the fact that the line of best fit sits consistently above the y=0 line. Deviance residuals are also used to identify outliers, since they are normalized any residual values which have a very large absolute value will be classed as outliers. In Figure 19 there is a good spread however and none of these points would be classed as outliers.  
+Another type of residual which we need to examine for any Cox model is the Schoenfeld residuals, (Schoenfeld, 1982) these are another specific type of residuals based around checking the proportional hazards assumption. These residuals are calculated separately for each explanatory variable in the model and are used to check for a non-random relationship with the time-to-event outcome variable. If there is determined to be a relationship between an explanatory variable and the dependent variable then this would violate the assumptions of the cox model. In our data set a violation would be discovering a relationship between strength and one of our explanatory variables since this would indicate that this variable is not independent of strength and this would indicate that proportional hazards do not hold since independence of these variables is a key assumption of the model.  
+In order to conduct the test with the Schoenfeld residuals we use the `cox.zph` function and examine the p-values, a low p-value indicates significant evidence of a non-random relationship with the dependent variable.
+```{r,fig.height=8}
+PHtest<-cox.zph(intcoxmod)
+PHtest
+```
+The results of this proportional hazards test can be seen in the p-values and this test shows that there is significant evidence at the 5% level of non-random relationships between strength and both material and stacking. This does not necessarily mean that the model is bad, since we have already shown that the model fits the data very well, but it does mean that we have to be careful when drawing conclusions from the model.  
+It is also possible to plot these results using the `ggcoxzph` function from the `survminer` package. Again note that the assumed dependent variable in a Cox model is time but time is not the only positive quantity for which these models can be used, as we are demonstrating throughout this whole tutorial.  
+```{r,fig.height=7,fig.width=9,fig.cap="Schoenfeld residual plot for intcoxmod"}
+ggcoxzph(PHtest)
+```
+Figure 21 shows the Schoenfeld residual results plotted, the solid line is the line of best fit while the dotted lines are used to show two standard deviations above and below the fit. These plots are interesting because from graphical inspection alone it can be argued that there is no clear relationship with strength ("Time", should be strength for our data) but the p-values would disagree.  
+A violation of the proportional hazards assumption can usually be resolved through adding an interaction term between the covariate and the dependent variable. In most cases where the Cox model is used the dependent variable would be time and the proportional hazards assumption is usually broken by "time-varying" covariates, these are often variables such as blood pressure which can change with time so adding a relationship with time would make sense. The context of our model makes this somewhat difficult because the material and stacking sequences do not vary as the tensile strength increases or decreases, these are fixed characteristics. Also we only have three observations for each combination of explanatory variables and in order to estimate these effects we would need to be able to hold all variables constant and examine the differences between the materials as we vary the strength. With the data we have this would not be reliable and would also create a much more complex model, the interpretations of which would go beyond the intended scope of this tutorial. That being said, adding an extra interaction term such as this is possible with our model as we only need to add a term for the interaction between strength and material. 
+```{r,warning=FALSE}
+extmod<-coxph(surv_object ~ material*stacking+ material:strength + strain_rate, data=tensile)
+cox.zph(extmod)
+```
+Checking the proportional hazards assumption again shows that adding this term does fix the issue of the violated assumption. However, for the structure of the data we have and the context of this data set, adding this interaction is difficult to properly justify and would not be recommended.
+
+\pagebreak
+
+# Conclusions
+
+All of the model selection discussion so far in this tutorial is an accurate reflection of the model selection process in statistics in general. Some tests and checks may seem trivial or unnecessary at first glance but a few of the results have demonstrated that surprises can always occur and these highlight the importance of being thorough. We now come to the final stage of the process which is comparing the different method used and selecting a final model. Selecting a final model may not always be necessary, reporting findings from multiple models is often a key characteristic of robust statistical analysis and a good analysis will report the results from all key models found throughout the model selection process. In the tensile strength context for example the model fits from our Cox models are very close to the fits from the AFT models so we would discuss the findings from both model types.  
+The saturated Weibull AFT model `weimod` and the equivalent log-normal model `lnmod` were shown to have the lowest AICs out of the three location-scale distributions with the Weibull model being determined by the AIC to have a very marginally better fit to the data. Figure 7 was very important to our analysis, despite being a plot of a reduced model
+this graph demonstrated the first signs of a non-constant difference between material and stacking sequence combinations, this effect is not possible to observe in the more saturated model plots such as Figure 10 due to the coarseness of the data but there are signs of it in the subsetted plots such as Figure 11 as we can see several predicted curves are not very close to any of the Kaplan-Meier estimated curves.  
+From this observation we then added the interaction term between material and strength which was shown to be a significant improvement to the model and the AIC this time determined that the log-normal was the best fitting distribution. A subset of the model predicted survival curves for this model can be seen in Figure 22 using the same method as before only this time we are taking a subset of only one value of strain rate which we have chosen to be the median value `strain_rate=384`. Doing this allows us to keep the plot labels for a more informative plot. Compared to the model without an interaction this does appear to have a significantly better fit to the data as the predicted curves are much closer to matching the observed survival curves, the only exception to the excellent fit being the predicted survival curve for GFRP, 0/90/45/-45 composites which is slightly underestimated. This plots shows a significant improvement on the poor estimation of CFRP composites which we observed in Figure 7 and demonstrates the effect of the interaction term. The goodness of fit plots in Figure 14 also demonstrated strong parallelism which is a good indicator of fit for the model and in general all signs point to the AFT model having a strong fit to the data.  
+```{r, echo=FALSE, fig.height=6,fig.width=8,fig.cap="Log-normal interaction model predictions"}
+plotdf2 <- subset(tensile, strain_rate==384)
+medKMfull <- survfit(Surv(strength,status)~material+stacking+strain_rate,data=plotdf2)
+lnplt = ggsurvplot(medKMfull, data = plotdf2, legend="bottom") + 
+  xlab("Tensile strength") + 
+  ggtitle("Subset: final log-normal model predictions") +
+  guides(colour = guide_legend(title="Kaplan-Meier:",ncol=2))
+pred_df <- gatherAFTpred(intlnmod, plotdf2, x=c("material","stacking","strain_rate"))
+lnplt$plot = lnplt$plot + geom_line(data=pred_df, 
+                                aes(x=x, y=y, group=combination,colour=combination))
+lnplt
+```
+It is unfortunate that we only have three data points for each group combination as the Kaplan-Meier curves are very simple because of the lack of observations to fit. It is also unfortunate that we have had to only plot a subset of results in our final graphs as we do not get to see the whole model fit but the cross-section that we do observe is still informative and this method is preferable to the extremely cluttered plot of every variable combination. These final plots for only one value of strain rate are very similar to the plots which Naresh, Shankar and Velmurugan did in their original analysis as we are still fitting curves to only three data points but the difference comes from the methods used in fitting.   
+The lack of observations is restricting on our analysis and is a key issue with the data set which we would look to fix, for a statistician more data is always useful and for our analysis more replicates of each variable combination would be useful for plotting. Beyond this, the extra data that would be desired depends on the aims of the investigation. The original research was focused on determining the tensile strengths and identifying which characteristics resulted in the greatest increase in tensile strength at higher strain rates, for this we would only desire more replicates to be more assured of our conclusions. Future investigations may wish to focus on different goals such as finding the most optimal stacking sequences or reinforcement materials in which case more data for the weakest stacking sequence, 30/-60/60/-30, would be unnecessary but we would perhaps want to examine new stacking sequences.  
+We could have handled the lack of data points by artificially merging some of the subgroups in the data together to create larger subgroups but reduce the number of groups in the data overall. This would have meant merging several of the strain rate values into one group, or ignoring strain rate as a variable altogether like we did in some of the reduced models. Ultimately though, the strain rate variable is significant according to every model output and while we did notice some patterns by using the reduced model, grouping subgroups together usually obscures, or sometimes even changes, some of the model conclusions.  
+
+The Cox proportional hazards model is rarely seen or even heard of in Engineering contexts but is extremely common in Bio-statistics and because of this the range of analysis tools for proportional hazards models is much larger than for AFT models which are used less often. The most widely used packages for time-to-event analysis such as `survival` and `survminer` have many functions available linked to the Cox model but comparatively few for other types of models. For engineers, the semi-parametric nature of the Cox model may still feel uncomfortable to deal with but this is not the only proportional hazards model in existence, just the most commonly used. Using this tutorial should highlight how straightforward it is conducting analysis of proportional hazards models with the functionality that exists in R, and how powerful they are as a modelling method. We have also only scratched the surface of the diagnostics and extensions which can be applied to them. 
+The final Cox version of our model does fit very well and we can use the subsetting method to plot our final Cox model predictions on top the corresponding Kaplan-Meier curves in Figure 23 just as we did in Figure 22. 
+```{r, echo=FALSE, fig.height=6,fig.width=8,fig.cap="Cox interaction model predictions"}
+plt = ggsurvplot(medKMfull, data = plotdf, legend="bottom") + 
+  xlab("Tensile strength") + 
+  ggtitle("Subset: final Cox model predictions") +
+  guides(colour = guide_legend(title="Kaplan-Meier:",ncol=2))
+pred_df <- gatherCoxpred(intcoxmod, plotdf2, x=c("material","stacking","strain_rate"),quantity="strength")
+plt$plot = plt$plot + geom_line(data=pred_df, 
+                                aes(x=x, y=y, group=combination,colour=combination))
+plt
+```
+Figure 23 shows a subset of the estimated survival curves for our final Cox model and we can see that the predicted curves are an excellent fit to the data. However compared to the Kaplan-Meier curves, the two predicted curves in the centre of the plot corresponding to GFRP composites with 0/90/45/-45 and 0/90/30/-60 stacking sequences are not fit quite as closely as we would like and have a slightly worse fit than the AFT model predictions do overall as here we have two curves which are misaligned rather than one. Overall the residual plots look very good but this model does have another negative point in that the Schoenfeld residual test determined that there is a proportional hazards assumption violation despite the appearance of the residual plots. This Cox model seems to be a very good model and we would be sure to include the results of this model in our analysis report but the proportional hazards test result and the slightly worse fitting predicted curves would sway the final model decision towards the log-normal AFT model as the best model for the data.  
+```{r,warning=FALSE}
+tidy(coef(intlnmod)) %>% kable(caption="Final model output",digits=4) %>% 
+  kable_styling(full_width = F,latex_options="hold_position")
+```
+Now that we have our final model we should interpret the estimated coefficients which can be found in Table 6. Remembering that this is an AFT model, the coefficients in Table 6 correspond to the logarithms of the ratio of median strength as we increase the value of each variable by 1 and the reference composites which we compare to are CFRP, 0/90/30/=60 stacked composites which are actually the strongest composites according to the data.  
+The coefficient of GFRP material represents the ratio of median strength of GFRP, 0/90/30/-60  stacked composites compared to the reference composites and the model estimates that the ratio between them is $\exp(-0.245)=0.783$, so that these composites have 22% lower median strength than CFRP, 0/90/30/-60 composites.  
+The strain rate coefficient represents the logarithm of the ratio of increase in tensile strength as the strain rate is increased by 1 and this is estimated to be 0.0895% ($\exp(0.0009)=1.0009$), this means that an increase of 100 strain rate is estimated to increase the median tensile strength by around 9%.  
+The first stacking coefficient represents the ratio of median strengths between CFRP, 0/90/45/-45 composites and the reference level which is estimated to be $\exp(-0.070)=0.932$ so that CFRP composites with this stacking sequence are estimated to be 6.8% weaker than the reference level composite.  
+We can use the first interaction coefficient as well as the material coefficient together to estimate the ratio between the median strengths of the two material types when the stacking sequence is 0/90/45/-45, $\exp(-0.245-0.123)=0.692$ so the model estimates that for this stacking sequence, GFRP composites are expected to be 30.8% weaker than CFRP composites. We can also go the other way with the interaction coefficient and the first stacking coefficient to estimate the ratio between the median strengths of 0/90/45/-45 stacked composites compared to 0/90/30/-60 stacked composites when GFRP is used as the material, for this we do $\exp(-0.070-0.123)=0.824$ to find that 0/90/45/-45 stacked composites are estimated to have 17.6% lower tensile strength than 0/90/30/-60 composites when the GFRP is used for the material.  
+We use the same method for the final stacking sequence which is 30/-60/60/30, for CFRP composites this stacking sequence is estimated to have 60.9% ($\exp(-0.938)=0.391$) lower tensile strength than the reference level and for GFRP composites the difference is estimated to be 49.4% ($\exp(-0.938+0.256)=0.506$). Going the other way, for this stacking sequence GFRP composites are estimated to have $\exp(-0.245+0.256)=1.011$ times the tensile strength of CFRP composites so are actually estimated to be 1% stronger.
+
+\pagebreak
+
+\pagebreak
+  
+# Bibliography
+
+Cox, D. and Oakes, D., 1998. Analysis of survival data. Boca Raton: Chapman & Hall/CRC.  
+
+Grolemund, H., n.d. 12 Tidy data | R for Data Science. [online] R4ds.had.co.nz. Available at: <https://r4ds.had.co.nz/tidy-data.html> [Accessed 21 June 2021].  
+
+Moore, D., 2016. Applied Survival Analysis Using R.  
+  
+Naresh, K., Shankar, K. and Velmurugan, R., 2018. Reliability analysis of tensile strengths using Weibull distribution in glass/epoxy and carbon/epoxy composites. Composites Part B: Engineering, 133, pp.129-144.  
+
+Schoenfeld, D., 1982. Partial residuals for the proportional hazards regression model. Biometrika, 69(1), pp.239-241.  
+
+\pagebreak
+
+# Appendix
+
+## How to access code through GitHub
+
+The full code for this tutorial and other necessary files can all be accessed via the online github repository which can be found at:  https://github.com/gregormca/time-to-event-tutorial-material-strength-data  
+This includes the .csv file for the tensile data set which is just a typed up, long-form version of the data originally collected in (Naresh, Shankar, Velmurugan, 2018). In addition, the full .Rmd file for this tutorial can also be found and has been made public to allow for the copying of code in order to reproduce the plots and outputs in the tutorial. The plotting wrapper functions can also be downloaded from this page.    
+As shown in the tutorial the wrapper functions can be loaded in to the global r environment by using the `source` function, as long as the .R files have been downloaded. If the files are not located in the current working directory then it will be necessary to include the file path when calling the function, for example `source(path/tofile/here.R)`. Otherwise, if the functions are saved to the current working directory then they can be loaded in using `source("function.R")`. Guides on how to use each function are included in this tutorial.
+
+## Disclaimer 
+
+The rest of the sections in this appendix are not necessarily targeted towards the users of the tutorial and are not needed for proper use of the tutorial. Instead, the remaining sections provide information on some more specific details involved in the making of this tutorial such as the process of creating the artificially censored data sets. These remaining sections are not intended to be read by the users of the tutorial but if so inclined anyone is welcome to read on.  
+
+## Artificial censoring 
+
+The first process that I will be discussing is the making of the artificially censored data sets. In reality, in order to introduce artificial censoring the only edits that need to be made are in the dependent variables which are used to create `Surv` objects and the explanatory variable data can be left untouched. Censoring is far too common a feature of time-to-event data to neglect discussing its effects in this tutorial but it is extremely rare to ever want censoring when the option of no censoring is also available. Artificial censoring is therefore quite a novel concept and is only otherwise seen in the creation of simulated time-to-event data which is the approach I had to take as well.  
+The method I used in order to simulate random censoring was to create a competing risk for the data. Competing risks is a reasonably advanced topic in time-to-event analysis and one that would be extremely unlikely to appear in an Engineering context such as the tensile strength data, instead it is much more likely to appear in a medical or biological setting. Basic time-to-event data will usually have a single endpoint which is either an event occurring or censoring taking place, a competing risk is a factor that can cause an event to occur from a source different to the one we are interested in. For example, in a medical study investigating time from diagnosis until death from a particular disease there may be another disease or cause of death which serves as a competing risk since the event (death) can only occur once, from one cause. In studies such as this, the usual approach if a patient were to die from another cause of death which was not of interest would be to censor the observation at the time of death. This approach does have its flaws, such as the assumption that censoring and the event of interest are independent when there are often relationships between diseases which can violate this assumption, but thankfully this is not a relevant issue for what the simulated data is needed for as we know the artificial competing risk is independent. Creating a competing risk and using it to censor data is also very easy to implement.  
+To simulate a competing risk in the simplest possible way I decided to simulate from an exponential distribution using `rexp`, because the exponential only has one parameter to edit, to create a competing time-to-event. I then compared the simulated draws from the exponential distribution next to the vector of tensile strengths and made it so that any observations where the simulated exponential draw was smaller than the observed tensile strength would result in a censored observation. I did by converting the logical vector `cens<strength` to a numeric indicator variable which became the new status variable for the censored data.  
+Simulating Type I censoring was far more straightforward since all it required was setting a maximum cutoff point which, in the actual context of the tensile data, would correspond to the maximum testing capacity of the machine used int he experiment. The aim was to have two different data sets with a similar proportion of censored observations and ideally a realistic proportion for Engineering which would be no more than 20%. Fixing a maximum value is the easier method and 400MPa tensile strength is a logical number for the tensile data so this was done first resulting in 23 censored observations. 
+After this I used the for loop to run through seeds from 1 to 200 and return all seeds which resulted in the same number of censored observations, this also helped to indicate what changes I needed to make to the rate parameter of the exponential distribution to achieve the desired results. Using the exponential distribution for this method did prove to be slightly less straightfoward due to the shapes of the data, the composites in the original study only started to break froma round 110MPa tensile strength and the exponential survival curves tend to drop in survival fast and slow down as the time, or strength, increases. This resulted in a very high percentage of observations being censored so to fix this I changed `cens` to take values starting from 100.  
+The final step was to select which seed to use for the exponential draws which would result in the best spread of censored observations for the purpose of being a good random censoring example. Again, due to the shape of the exponential there were many seeds which resulted in lots of composites being censored at very low values of tensile strength but I settled on seed 122 which had a reasonably even spread of censored observations which meant that censoring was more visible in the example graphs rather than having almost all censoring cross marks at the top of the plot. The exact code used to simulate the censored data sets is available in the github repository.  
+```{r,include=FALSE}
+strengthc <- tensile$strength
+n <- 126
+for(i in 1:200){
+  set.seed(i)
+  cens<-100 + rexp(n,rate=0.0009)
+  y<-pmin(strengthc,cens)
+  status1<-1*(strengthc<cens)
+  if(sum(status1)*100/126 <82 &&sum(status1)*100/126 >81){
+    print(i)
+  }
+}
+```
+```{r, echo=FALSE}
+#random censoring
+set.seed(122) 
+strengthc <- tensile$strength
+n <- 126
+cens<-100 + rexp(n,rate=0.0009)
+y<-pmin(strengthc,cens)
+status1<-1*(strengthc<cens)
+Surv_cens_rand <- Surv(y,status1) # new surv object
+
+# type 1 censoring
+s_max<-400
+y2<-pmin(strengthc,s_max)
+status2<-1*(strengthc<s_max)
+Surv_cens_max<-Surv(y2,status2) # new surv object
+#new censored datasets
+rc_tensile <- tensile %>% 
+  mutate(strength = y, status= status1)
+mc_tensile <- tensile %>% 
+  mutate(strength = y2, status=status2)
+```
+
+## Wrapper functions 
+
+In the interest of keeping the tutorial on the topic of analysis rather than programming I decided it was best to create wrapper functions for the plotting methods used to plot model predictions on top of the empirical data shown by the Kaplan-Meier curves. As a concept this easy to visualize but the functionality and methods used by R packages do not always make things easier.  
+The first issue I encountered was that due to the methodology and environments used by the function, `ggsurvplot` cannot be called from inside a wrapper function. This meant that in order to be able to create plots in one line, as was the original aim, I would have to create the wrapper functions using base R instead. Good progress was made with this version of the wrapper function but the plot readability was a significant weak point as colour coding and labeling all the lines plotted proved extremely difficult and pressing on with this method would have led almost to creating my own R package for plotting and detracted from the goal of creating a tutorial on the full time-to-event analysis process. From here the vision for the wrapper functions led back to `ggsurvplot` and I adapted the functionality to instead create a data frame of predictions which can be passed to `ggsurvplot`.  
+To begin with I focused only on gathering AFT model predictions and made good progress with the function. The benefit of this method was that automating the axis labels and plot titles was no longer necessary as these could be specified outside the function since the aim was no longer to create a plot. The function works by creating a data frame of the unique combinations of variables and predicting the time-to-event values that correspond to each quantile provided from 0.99 to 0.01. There were only a few setbacks when it came to the predicted curve labels which were caused by R using numeric factor levels instead of plotting the name of the factor level. The actual plot outputs were satisfactory but the coarseness of the tensile data meant that plot readability was still not good enough and after trying to add methods to the function to deal with this I later realized that the solution was to subset the data for plots. The models themselves can still be fit on the full data set but it is not necessary to usee all of the data for prediction and subsetting does not affect the Kaplan-Meier curves either.  
+Adding the functionality to deal with Cox model predictions proved to be a bigger issue as `predict` cannot be used in the same way. In general it is easier to use `survfit`, passing a `coxph` object instead to obtain a predicted survival function, `ggsurvplot` also allows a list of `survfit` objects to be passed into its first argument and by setting `combine=TRUE` both objects can be plotted together on the same plot. However, the predicted `survfit` object is indexed by row numbers and these are used as the labels when plotting, the actual variable levels are lost. This meant that providing a table of the data frame used for prediction was necessary for every plot so that a reader could match the row number to the predicted curve label and the plot legends were useless on their own. To improve on this I had to return to using `predict` and I found that by providing strength values as well as explanatory variable values and using `type="survival"` meant that `predict` would provide estimated survival probabilities for the specific group at the strength value specified.  
+The wrapper function for Cox plotting now followed the same concept as the AFT version, only with opposite variables being provided to and estimated by `predict`. For Cox models, a sequence of 100 time-to-event quantities are provided, from 10% below the minimum observed value in the data to 10% above the maximum value observed in the data. The 10% buffers allow for plotting predictions which underestimate or overestimate the actual data. Each combination of covariate values is then replicated 100 times as well and lined next to the sequence of tensile strengths. `predict` then outputs the estimated survival probability for the combination of variables provided at the strength value specified. These predictions are then gathered together and the resulting data frame can be used to plot a survival curve. Both methods of predicting could have been included in a single wrapper function for both AFT and Cox modles but the additional arguments necessary for the different methods meant that it was simpler to make two separate functions.
+
+## Further analysis
+
+In this section I will briefly discuss further analysis that can be done or would be interesting to do for the tensile data set.  
+In the original research in (Naresh, Shankar and Velmurugan, 2018), one of the aims was to find the covariate combination which resulted in the largest increase in tensile strengths as the strain rate was increased, because of this it would have been useful to compare similar conclusions despite the very different methodologies. In order to estimate this using the methods in this tutorial it would have been necessary to use models which included strain rate interactions. However, with the primary function of this project being a tutorial, I decided to build the statistical models based on observations made throughout the process and the first evidence of interactions led to the inclusion of the `material:stacking` term first. I then stopped at this level of complexity in order to keep the final model simple enough to be understood easily by a beginner.  
+While conducting my own model selection process there were a few more complex models that were tested which I decided to exclude from the tutorial analysis in the interest of having a simpler final model in the conclusion. After testing the interaction models which are used in the tutorial I also tested models which included further interaction terms such as the model with formula `Surv(strength,status)~(material+stacking)*strain_rate+material:stacking`, which has an interaction term between each pair of covariates. Further `anova` tests on these more complex models found that some of the added terms were significant improvements to the model but I decided not to include this further step in the analysis. The reason for this is that this project is aimed as a tutorial for Engineers and having a complex final model whose coefficients are exceedingly complicated to explain is likely to intimidate a beginner to this type of analysis so I thought it best for the tutorial that the final model did not end up being too complex. 
